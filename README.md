@@ -219,7 +219,7 @@ A message is flagged as processed once examined, regardless of whether individua
 
 Full write-up:
 
-* [The Counteroffensive: Automated Spam Reporting with Spamhaus](https://dev.to/battlehardened/the-counteroffensive-automated-spam-reporting-with-spamhaus)
+* [The Counteroffensive: Automated Spam Reporting with Spamhaus](https://dev.to/battlehardened/the-counteroffensive-automated-spam-reporting-with-spamhaus-j6e)
 
 * See also: [Why Your Email Is an Open Door for Spammers — And How to Lock It](https://dev.to/battlehardened/why-your-email-is-an-open-door-for-spammers-and-how-to-lock-it-1k1n)
 
