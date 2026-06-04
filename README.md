@@ -1,0 +1,230 @@
+# spamhaus-reporting
+
+Automated spam analysis and Spamhaus submission. Watches your IMAP Junk folder, extracts infrastructure indicators from each message, and submits them to the Spamhaus Threat Intel Community API.
+
+No local database or flat files required — state is tracked via a custom IMAP keyword flag (`$SpamhausProcessed`) set directly on each message after processing.
+
+---
+
+## What it does
+
+For each unprocessed message in your Junk folder, the script:
+
+- Extracts the sending IP from the topmost `Received-SPF` header
+- Extracts sending domains from `From`, `Reply-To`, `Return-Path`, and `DKIM-Signature d=`
+- Extracts and normalizes CTA URLs from the HTML body
+- Looks up the sending IP against RIPE Stat for infrastructure context
+- Submits IP, domains, URLs, and a raw email sample to the Spamhaus API
+- Flags the message as processed on the mail server
+- Deduplicates indicators within each run via an in-memory state tracker
+- Logs a grouped submission summary after each run that processes messages
+
+---
+
+## Requirements
+
+- Python 3.8+
+- A Spamhaus Threat Intel Community account and API token
+- An IMAP mail account with Junk folder access
+- IMAP server that supports custom keyword flags (Dovecot, Cyrus, Gmail — most modern providers)
+
+```bash
+pip install bs4 requests
+```
+
+---
+
+## Configuration
+
+All settings via environment variables:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `IMAP_SERVER` | Yes | — | IMAP server hostname |
+| `IMAP_PORT` | No | `993` | IMAP port |
+| `IMAP_USER` | Yes | — | Your full email address |
+| `IMAP_PASSWORD` | Yes | — | Your IMAP password |
+| `SPAMHAUS_TOKEN` | Yes | — | Spamhaus submission API token |
+| `IMAP_FOLDER` | No | `Junk` | Folder to watch |
+| `DRY_RUN` | No | `0` | Set to `1` to parse without submitting or flagging |
+| `DELAY` | No | `2` | Seconds between new API submissions |
+| `VERBOSE_LIST` | No | `0` | Set to `1` to log every submission with its status |
+
+**Getting a Spamhaus API token:**
+
+Register at [submit.spamhaus.org](https://submit.spamhaus.org), then go to [auth.spamhaus.org/account](https://auth.spamhaus.org/account), scroll to "API Key Creation", and create a key. Copy it immediately — it's only shown once.
+
+Verify the threat type codes valid for your account tier before running:
+
+```bash
+curl -s -H "Authorization: Bearer $SPAMHAUS_TOKEN" \
+  https://submit.spamhaus.org/portal/api/v1/lookup/threats-types
+```
+
+---
+
+## Usage
+
+**Always dry run first:**
+
+```bash
+DRY_RUN=1 python3 spam-monitor.py
+```
+
+This parses every unprocessed message and logs what would be submitted without touching the API or setting any flags. Check the output before running live.
+
+**Single run:**
+
+```bash
+python3 spam-monitor.py
+```
+
+**Daemon mode (checks every 5 minutes):**
+
+```bash
+python3 spam-monitor.py --daemon --interval 300
+```
+
+**Cron job (every 10 minutes):**
+
+```
+*/10 * * * * cd /path/to/spamhaus-reporting && python3 spam-monitor.py
+```
+
+**Full submission detail:**
+
+```bash
+VERBOSE_LIST=1 python3 spam-monitor.py
+```
+
+---
+
+## Running as a systemd service
+
+For production use on Linux, systemd is cleaner than cron or a manual daemon. Since this runs under your own account, use a user-level service rather than a system-wide one.
+
+Create the service file at `~/.config/systemd/user/spamhaus-reporting.service`:
+
+```ini
+[Unit]
+Description=Spamhaus Reporting — automated spam submission
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/spamhaus-reporting
+ExecStart=/usr/bin/python3 spam-monitor.py --daemon --interval 300
+Restart=on-failure
+RestartSec=30
+EnvironmentFile=%h/.config/spamhaus-reporting/env
+
+[Install]
+WantedBy=default.target
+```
+
+Create the environment file at `~/.config/spamhaus-reporting/env`:
+
+```bash
+IMAP_SERVER=mail.example.com
+IMAP_PORT=993
+IMAP_USER=you@example.com
+IMAP_PASSWORD=your_imap_password
+SPAMHAUS_TOKEN=your_spamhaus_api_token
+IMAP_FOLDER=Junk
+DELAY=2
+```
+
+Lock down the permissions so credentials aren't readable by other users:
+
+```bash
+chmod 700 ~/.config/spamhaus-reporting
+chmod 600 ~/.config/spamhaus-reporting/env
+```
+
+Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable spamhaus-reporting
+systemctl --user start spamhaus-reporting
+```
+
+Check it's running:
+
+```bash
+systemctl --user status spamhaus-reporting
+journalctl --user -u spamhaus-reporting -f
+```
+
+To have the service start automatically at boot even when you're not logged in:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+---
+
+The script uses a custom IMAP keyword flag (`$SpamhausProcessed`) instead of a local database or flat file. This means:
+
+- No local files to manage or back up
+- State survives the script being moved to a different machine
+- Processed messages are visible in any mail client that shows keyword flags
+
+On startup, the script runs a functional capability test — it attempts to set and immediately remove a test flag (`$SpamhausCapabilityTest`) on the first available message. If the server rejects custom keywords, the script aborts cleanly.
+
+A message is flagged as processed once examined, regardless of whether individual API submissions succeeded. Spamhaus returns HTTP 208 for already-known indicators, which handles any cross-run duplicates gracefully.
+
+---
+
+## Sample output
+
+```
+2026-06-03 14:22:01 INFO Connected to mail.example.com:993 as you@example.com
+2026-06-03 14:22:01 INFO Folder Junk: 12 unprocessed message(s)
+2026-06-03 14:22:02 INFO Processing message UID 4821
+2026-06-03 14:22:02 INFO   IP=45.92.72.11 primary_domain=rewardsclaim.lat
+2026-06-03 14:22:02 INFO   Subject: You have been selected
+2026-06-03 14:22:02 INFO   Auth: spf=pass dkim=pass dmarc=pass (p=none)
+2026-06-03 14:22:02 INFO   RIR: netname=NEW-AMUSER-HOUSING-NET2 country=IT
+2026-06-03 14:22:03 INFO   IP 45.92.72.11 — OK
+2026-06-03 14:22:05 INFO   DOMAIN rewardsclaim.lat — OK
+2026-06-03 14:22:05 INFO   EMAIL rewardsclaim.lat — OK
+2026-06-03 14:22:07 INFO   URL https://rewardsclaim.lat/go — OK
+2026-06-03 14:22:07 INFO   Flagged message UID 4821 as processed
+...
+2026-06-03 14:23:14 INFO Done. 12 message(s) processed.
+2026-06-03 14:23:14 INFO Spamhaus totals (30 days): 312 submitted — 187 corroborated (59%), 125 new intelligence (40%)
+2026-06-03 14:23:14 INFO   DOMAIN: 84 listed, 12 checked/not listed, 7 pending
+2026-06-03 14:23:14 INFO   EMAIL: 41 listed, 8 checked/not listed, 3 pending
+2026-06-03 14:23:14 INFO   IP: 73 listed, 11 checked/not listed, 5 pending
+2026-06-03 14:23:14 INFO   URL: 35 listed, 6 checked/not listed, 4 pending
+```
+
+---
+
+## Known limitations
+
+**IP extraction requires `Received-SPF`.** The script extracts IPs only from the topmost `Received-SPF` header, written by your MTA on arrival. If that header is absent, no IP is submitted. The `Received` chain is not used as a fallback because it risks reporting legitimate forwarding infrastructure.
+
+**Domains from envelope headers may include spoofed legitimate domains.** If a message spoofs a well-known brand in the `From` header and your server doesn't drop it, the script will attempt to report that domain. Spamhaus's analyst review process handles false positives.
+
+**URL landing domains may be legitimate redirectors.** CDN hostnames, link shorteners, and ESP tracking domains sometimes appear in spam. The script submits them — whether that adds intelligence value depends on the campaign.
+
+**IMAP keyword support varies.** Most modern servers support custom keywords. Some hosted providers don't. The script tests for support at startup and aborts if the server rejects the flag.
+
+---
+
+## Background
+
+Full write-up:
+
+* [The Counteroffensive: Automated Spam Reporting with Spamhaus](https://dev.to/battlehardened/the-counteroffensive-automated-spam-reporting-with-spamhaus)
+
+* See also: [Why Your Email Is an Open Door for Spammers — And How to Lock It](https://dev.to/battlehardened/why-your-email-is-an-open-door-for-spammers-and-how-to-lock-it-1k1n)
+
+---
+
+## License
+
+MIT

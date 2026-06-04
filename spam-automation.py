@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+spam-monitor.py — Automated spam analysis and Spamhaus submission
+
+Monitors an IMAP Junk folder for spam, extracts infrastructure indicators,
+and submits them to the Spamhaus API. Uses a custom IMAP flag for state
+tracking — no local database or flat files required.
+
+Required environment variables:
+    IMAP_SERVER      — e.g. mail.example.com
+    IMAP_PORT        — e.g. 993 (default)
+    IMAP_USER        — your full email address
+    IMAP_PASSWORD    — your IMAP password
+    SPAMHAUS_TOKEN   — your Spamhaus submission API token
+
+Optional environment variables:
+    IMAP_FOLDER      — folder to watch (default: Junk)
+    DRY_RUN          — set to "1" to parse without submitting (default: 0)
+    DELAY            — seconds between API calls (default: 2)
+    VERBOSE_LIST     — set to "1" to log every submission with its status (default: 0)
+
+Usage:
+    python3 spam-monitor.py             # run once
+    python3 spam-monitor.py --daemon    # run continuously
+    DRY_RUN=1 python3 spam-monitor.py   # dry run
+"""
+
+import imaplib
+import email
+import email.policy
+import os
+import re
+import sys
+import json
+import time
+import logging
+import argparse
+import socket
+import ipaddress
+import urllib.request
+import requests
+from collections import defaultdict
+from email.utils import getaddresses
+from functools import lru_cache
+from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
+from bs4 import BeautifulSoup
+
+# ─────────────────────────────────────────────
+# CONFIGURATION FROM ENVIRONMENT
+# ─────────────────────────────────────────────
+
+IMAP_SERVER    = os.environ.get('IMAP_SERVER', '')
+IMAP_PORT      = int(os.environ.get('IMAP_PORT', 993))
+IMAP_USER      = os.environ.get('IMAP_USER', '')
+IMAP_PASSWORD  = os.environ.get('IMAP_PASSWORD', '')
+SPAMHAUS_TOKEN = os.environ.get('SPAMHAUS_TOKEN', '')
+IMAP_FOLDER    = os.environ.get('IMAP_FOLDER', 'Junk')
+DRY_RUN        = os.environ.get('DRY_RUN', '0').strip() == '1'
+DELAY          = float(os.environ.get('DELAY', '2'))
+VERBOSE_LIST   = os.environ.get('VERBOSE_LIST', '0').strip() == '1'
+
+SPAMHAUS_API    = 'https://submit.spamhaus.org/portal/api/v1'
+RIR_API         = 'https://stat.ripe.net/data/whois/data.json'
+
+# Custom IMAP keyword flag set on messages after processing.
+# State lives on the mail server — no local files needed.
+# Spamhaus 208 ("already reported") handles any indicator duplicates across runs.
+PROCESSED_FLAG  = '$SpamhausProcessed'
+CAPABILITY_FLAG = '$SpamhausCapabilityTest'
+
+# Tracking parameters appended by spam campaigns to generate unique URLs per recipient.
+_TRACKING_PARAMS = frozenset({
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+    'fbclid', 'gclid', 'msclkid', 'mc_eid', 'mc_cid',
+})
+
+# Enforce a global socket timeout to prevent half-open TCP hangs
+socket.setdefaulttimeout(60)
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────
+
+def _normalize_domain(domain):
+    """Normalize a domain using IDNA encoding to collapse internationalized variants."""
+    if not domain:
+        return ''
+    try:
+        return domain.strip().encode('idna').decode('ascii').lower()
+    except Exception:
+        return domain.strip().lower()
+
+def _is_internal_ip(ip):
+    """Return True if the IP string is loopback, private, link-local, or reserved."""
+    try:
+        return _is_internal_addr(ipaddress.ip_address(ip))
+    except ValueError:
+        return True
+
+def _is_internal_addr(addr):
+    """Return True if the ipaddress object is loopback, private, link-local, or reserved."""
+    return (addr.is_private or addr.is_loopback or
+            addr.is_link_local or addr.is_reserved)
+
+# ─────────────────────────────────────────────
+# EMAIL PARSING
+# ─────────────────────────────────────────────
+
+def extract_sending_ip(msg):
+    """Extract sending IP from the topmost Received-SPF header.
+    Only the topmost header is trusted — it was written by our MTA on arrival.
+    Lower headers could be forged by the sender. If Received-SPF is absent,
+    no IP is extracted rather than risk reporting a legitimate forwarding hop."""
+    spf_headers = msg.get_all('Received-SPF') or []
+    if spf_headers:
+        match = re.search(r'client-ip=([0-9a-fA-F.:]+)', str(spf_headers[0]))
+        if match:
+            ip = match.group(1).strip()
+            if not _is_internal_ip(ip):
+                return ip
+    return None
+
+def extract_envelope_domains(msg):
+    """Extract all unique IDNA-normalized domains from envelope headers and DKIM signature.
+    Uses email.utils.getaddresses for RFC-compliant address parsing.
+    DKIM d= is often the most reliable indicator — identifies signing domain
+    regardless of what From claims."""
+    domains = set()
+
+    for field in ('From', 'Reply-To', 'Return-Path'):
+        # Cast to str — email.policy.default returns header objects not raw strings
+        headers_raw = [str(h) for h in (msg.get_all(field) or [])]
+        for _, addr in getaddresses(headers_raw):
+            if '@' in addr:
+                domain = _normalize_domain(addr.rsplit('@', 1)[1])
+                if domain:
+                    domains.add(domain)
+
+    for dkim_header in msg.get_all('DKIM-Signature') or []:
+        flat = re.sub(r'\s+', '', str(dkim_header))
+        match = re.search(r'\bd=([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', flat, re.IGNORECASE)
+        if match:
+            domains.add(_normalize_domain(match.group(1)))
+
+    return domains
+
+def extract_primary_domain(msg):
+    """Extract the primary sending domain, preferring DKIM d= over Return-Path.
+    DKIM d= identifies the signing domain regardless of what From claims.
+    Falls back to Return-Path domain if no DKIM signature is present."""
+    for dkim_header in msg.get_all('DKIM-Signature') or []:
+        flat = re.sub(r'\s+', '', str(dkim_header))
+        match = re.search(r'\bd=([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', flat, re.IGNORECASE)
+        if match:
+            return _normalize_domain(match.group(1))
+
+    headers_raw = [str(h) for h in (msg.get_all('Return-Path') or [])]
+    for _, addr in getaddresses(headers_raw):
+        if '@' in addr:
+            return _normalize_domain(addr.rsplit('@', 1)[1])
+
+    return None
+
+def extract_auth_results(msg):
+    """Extract SPF, DKIM, DMARC results from Authentication-Results header.
+    Uses the top-most header (written by our MTA), strips line folding,
+    and extracts the first result per type."""
+    auth_headers = msg.get_all('Authentication-Results') or []
+    if not auth_headers:
+        return {'spf': 'unknown', 'dkim': 'unknown', 'dmarc': 'unknown', 'dmarc_policy': 'unknown'}
+
+    # Top-most header is from our MTA — flatten line folding
+    auth = re.sub(r'\s+', ' ', str(auth_headers[0]))
+
+    def extract(pattern):
+        m = re.search(pattern, auth, re.IGNORECASE)
+        return m.group(1).lower() if m else 'unknown'
+
+    spf          = extract(r'\bspf=(pass|fail|softfail|neutral|none|permerror|temperror)\b')
+    dkim         = extract(r'\bdkim=(pass|fail|none|policy|neutral|temperror|permerror)\b')
+    dmarc        = extract(r'\bdmarc=(pass|fail|none|bestguesspass|temperror|permerror)\b')
+    dmarc_policy = extract(r'\b(?:policy\.[A-Za-z_-]*|p)=([A-Za-z]+)')
+
+    return {'spf': spf, 'dkim': dkim, 'dmarc': dmarc, 'dmarc_policy': dmarc_policy}
+
+def normalize_url(href):
+    """Strip tracking parameters, sort remaining params, lowercase hostname,
+    and strip default ports for consistent deduplication.
+    Returns None if the URL is critically malformed so callers can discard it."""
+    try:
+        parsed = urlparse(href)
+        port = parsed.port  # raises ValueError on malformed ports e.g. :abc
+        clean_params = sorted(
+            (k, v) for k, v in parse_qsl(parsed.query)
+            if k.lower() not in _TRACKING_PARAMS
+        )
+        hostname = _normalize_domain(parsed.hostname or '')
+        if not hostname:
+            return None
+        # Strip scheme-default ports
+        if (parsed.scheme == 'https' and port == 443) or (parsed.scheme == 'http' and port == 80):
+            port = None
+        netloc = hostname if port is None else f'{hostname}:{port}'
+        return urlunparse(parsed._replace(netloc=netloc, query=urlencode(clean_params)))
+    except Exception:
+        return None
+
+def extract_cta_urls(msg):
+    """Extract action URLs from HTML body. Strips tracking parameters and skips
+    unsubscribe/optout links which are structural, not malicious endpoints."""
+    urls = set()
+    for part in msg.walk():
+        if part.get_content_type() == 'text/html':
+            soup = None
+            try:
+                html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                soup = BeautifulSoup(html, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    href = a['href'].strip()
+                    if not href.startswith(('http://', 'https://')):
+                        continue
+                    if any(s in href.lower() for s in ('unsub', 'optout', 'opt-out', 'remove', 'list-unsubscribe')):
+                        continue
+                    normalized = normalize_url(href)
+                    if normalized:
+                        urls.add(normalized)
+            except Exception as e:
+                log.debug(f'URL extraction error: {e}')
+            finally:
+                if soup:
+                    soup.decompose()
+    return list(urls)
+
+@lru_cache(maxsize=2048)
+def rir_lookup(ip):
+    """Look up IP infrastructure details via RIPE Stat (aggregates all RIRs globally).
+    Results cached with a fixed upper bound via lru_cache to prevent memory growth."""
+    if not ip:
+        return {}
+    try:
+        url = f'{RIR_API}?resource={ip}'
+        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        records = data.get('data', {}).get('records', [])
+        result = {}
+        for group in records:
+            for record in group:
+                key = record.get('key', '').lower()
+                if key in ('netname', 'org', 'country', 'descr'):
+                    result[key] = record.get('value', '')
+        return result
+    except Exception as e:
+        log.debug(f'RIR lookup failed for {ip}: {e}')
+        return {}
+
+def parse_message(raw_bytes):
+    """Parse a raw email and extract all indicators."""
+    msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+
+    ip               = extract_sending_ip(msg)
+    envelope_domains = extract_envelope_domains(msg)
+    urls             = extract_cta_urls(msg)
+    auth             = extract_auth_results(msg)
+
+    primary_domain = extract_primary_domain(msg)
+
+    return {
+        'ip':               ip,
+        'primary_domain':   primary_domain,
+        'envelope_domains': envelope_domains,
+        'urls':             urls,
+        'auth':             auth,
+        'subject':          str(msg.get('Subject', '')),
+        'rspamd':           str(msg.get('X-Rspamd-Score', 'N/A')),
+    }
+
+# ─────────────────────────────────────────────
+# SPAMHAUS API
+# ─────────────────────────────────────────────
+
+# Threat types validated against GET /lookup/threats-types.
+# Conservative defaults — stronger assertions require stronger evidence.
+THREAT_IP     = 'spam'   # bulletproof requires ASN-level evidence we don't have
+THREAT_DOMAIN = 'spam'   # phish requires confirmed credential harvesting
+THREAT_URL    = 'scam'   # scam fits reward/credential harvesting lures
+THREAT_EMAIL  = 'spam'
+
+REASON_IP = lambda ripe, auth: (
+    f'Spam source. RIR: netname={ripe.get("netname","unknown")} '
+    f'org={ripe.get("org", ripe.get("descr","unknown"))} '
+    f'country={ripe.get("country","unknown")}. '
+    f'Auth: spf={auth.get("spf")} dkim={auth.get("dkim")} '
+    f'dmarc={auth.get("dmarc")} (p={auth.get("dmarc_policy","unknown")}). '
+    f'Found in Junk folder.'
+)
+REASON_DOMAIN = 'Spam domain found in Junk folder.'
+REASON_URL    = 'Scam URL extracted from spam email body.'
+REASON_EMAIL  = 'Spam email found in Junk folder.'
+
+def spamhaus_request(endpoint, payload=None, method='POST', retries=3):
+    """Pure HTTP function. Makes a Spamhaus API call with retry on 429."""
+    url     = f'{SPAMHAUS_API}/{endpoint}'
+    headers = {'Authorization': f'Bearer {SPAMHAUS_TOKEN}'}
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.request(
+                method, url,
+                headers=headers,
+                json=payload if payload is not None else None,
+                timeout=30
+            )
+            if resp.status_code == 429:
+                log.warning(f'Rate limited — waiting 60s (attempt {attempt}/{retries})')
+                time.sleep(60)
+                continue
+            elif resp.status_code == 208:
+                return 208, resp.json() if resp.text else {}
+            elif not resp.ok:
+                try:
+                    err_payload = resp.json()
+                except Exception:
+                    err_payload = {'error': resp.text}
+                log.error(f'HTTP {resp.status_code}: {err_payload}')
+                return resp.status_code, err_payload
+            return resp.status_code, resp.json() if resp.text else {}
+        except Exception as e:
+            log.error(f'Request error: {e}')
+            return 0, {}
+    return 429, {'message': 'rate limit retries exhausted'}
+
+def submit(submission_type, key, object_value, threat_type, reason):
+    """Submit a single indicator to Spamhaus. Handles dry run and logging.
+    Deduplication is handled at the run level via state_tracker.
+    Spamhaus 208 handles indicator duplicates across runs."""
+    label = key.replace('email:', '') if submission_type == 'email' else key
+    if DRY_RUN:
+        log.info(f'  [DRY RUN] Would submit {submission_type.upper()}: {label}')
+        return
+    status, body = spamhaus_request(f'submissions/add/{submission_type}', {
+        'threat_type': threat_type,
+        'reason': reason,
+        'source': {'object': object_value}
+    })
+    if status in (200, 208):
+        log.info(f'  {submission_type.upper()} {label} — {"OK" if status == 200 else "already reported"}')
+        if status == 200:
+            time.sleep(DELAY)
+    else:
+        log.warning(f'  {submission_type.upper()} {label} — failed ({status}): {body}')
+
+def check_submission_count():
+    """Log submission count, breakdown by type, and optionally full submission list."""
+    status, data = spamhaus_request('submissions/count', method='GET')
+    if status != 200:
+        log.warning(f'Could not fetch submission count: HTTP {status}')
+        return
+
+    total       = data.get('total', 0)
+    matched     = data.get('matched', 0)
+    new         = total - matched
+    pct_matched = int(matched / total * 100) if total else 0
+    pct_new     = int(new / total * 100) if total else 0
+    log.info(
+        f'Spamhaus totals (30 days): {total} submitted — '
+        f'{matched} corroborated ({pct_matched}%), '
+        f'{new} new intelligence ({pct_new}%)'
+    )
+
+    status, items = spamhaus_request('submissions/list?items=10000', method='GET')
+    if status != 200:
+        log.warning(f'Could not fetch submissions list: HTTP {status}')
+        return
+
+    groups = defaultdict(lambda: {'listed': 0, 'checked': 0, 'pending': 0})
+    for item in items:
+        t = item.get('submission_type', 'unknown')
+        if item.get('listed'):
+            groups[t]['listed'] += 1
+        elif item.get('last_check'):
+            groups[t]['checked'] += 1
+        else:
+            groups[t]['pending'] += 1
+
+    for t, counts in sorted(groups.items()):
+        log.info(
+            f'  {t.upper()}: {counts["listed"]} listed, '
+            f'{counts["checked"]} checked/not listed, '
+            f'{counts["pending"]} pending'
+        )
+
+    if VERBOSE_LIST:
+        log.info('--- Verbose submission list ---')
+        for item in items:
+            stype = item.get('submission_type', '?')
+            if stype == 'email':
+                obj = item.get('attributes', {}).get('subject', '(no subject)')
+            else:
+                obj = item.get('source', {}).get('object', '?')
+            listed = item.get('listed')
+            if listed:
+                status_str = f'listed: {", ".join(listed)}'
+            elif item.get('last_check'):
+                status_str = 'checked, not listed'
+            else:
+                status_str = 'pending review'
+            log.info(f'  {stype.upper()} {obj} — {status_str}')
+
+# ─────────────────────────────────────────────
+# PROCESSING
+# ─────────────────────────────────────────────
+
+def process_message(raw_bytes, state_tracker):
+    """Parse a message and submit indicators to Spamhaus.
+    state_tracker deduplicates indicators across messages within a single run."""
+    parsed = parse_message(raw_bytes)
+    auth   = parsed['auth']
+
+    log.info(f'  IP={parsed["ip"]} primary_domain={parsed["primary_domain"]}')
+    log.info(f'  Subject: {parsed["subject"]}')
+    log.info(f'  Rspamd: {parsed["rspamd"]}')
+    log.info(f'  Auth: spf={auth.get("spf")} dkim={auth.get("dkim")} dmarc={auth.get("dmarc")} (p={auth.get("dmarc_policy")})')
+
+    if parsed['ip'] and parsed['ip'] not in state_tracker['ips']:
+        state_tracker['ips'].add(parsed['ip'])
+        # Defer RIR lookup until after dedup check — no network I/O for already-seen IPs
+        ripe = rir_lookup(parsed['ip'])
+        if ripe:
+            log.info(f'  RIR: netname={ripe.get("netname")} country={ripe.get("country")}')
+        submit('ip', parsed['ip'], parsed['ip'], THREAT_IP, REASON_IP(ripe, auth))
+
+    for domain in parsed['envelope_domains']:
+        if domain not in state_tracker['domains']:
+            state_tracker['domains'].add(domain)
+            submit('domain', domain, domain, THREAT_DOMAIN, REASON_DOMAIN)
+
+    # One raw email sample per primary domain per run
+    if parsed['primary_domain'] and parsed['primary_domain'] not in state_tracker['emails']:
+        state_tracker['emails'].add(parsed['primary_domain'])
+        key = f'email:{parsed["primary_domain"]}'
+        MAX_EMAIL_BYTES = 1024 * 1024  # 1MB cap — truncate bytes before decoding
+        email_sample = raw_bytes[:MAX_EMAIL_BYTES].decode('utf-8', errors='replace')
+        submit('email', key, email_sample, THREAT_EMAIL, REASON_EMAIL)
+
+    for url in parsed['urls']:
+        if url not in state_tracker['urls']:
+            state_tracker['urls'].add(url)
+            submit('url', url, url, THREAT_URL, REASON_URL)
+        # Submit landing domain from URL if not already seen
+        try:
+            hostname = _normalize_domain(urlparse(url).hostname or '')
+            if hostname and hostname not in parsed['envelope_domains'] and hostname not in state_tracker['domains']:
+                state_tracker['domains'].add(hostname)
+                submit('domain', hostname, hostname, THREAT_DOMAIN,
+                       f'Landing domain extracted from spam URL. {REASON_DOMAIN}')
+        except Exception as e:
+            log.debug(f'Could not extract landing domain from URL: {e}')
+
+# ─────────────────────────────────────────────
+# IMAP
+# ─────────────────────────────────────────────
+
+def connect_imap():
+    """Connect to IMAP server with explicit timeout to prevent half-open TCP hangs."""
+    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=60)
+    conn.login(IMAP_USER, IMAP_PASSWORD)
+    log.info(f'Connected to {IMAP_SERVER}:{IMAP_PORT} as {IMAP_USER}')
+    return conn
+
+def run_once():
+    """Connect, process unprocessed messages in Junk, flag processed, disconnect."""
+    if not all([IMAP_SERVER, IMAP_USER, IMAP_PASSWORD, SPAMHAUS_TOKEN]):
+        log.error('Missing required environment variables.')
+        sys.exit(1)
+
+    if DRY_RUN:
+        log.info('*** DRY RUN mode — no submissions or flags will be applied ***')
+
+    conn = None
+    total_processed = 0
+
+    try:
+        conn = connect_imap()
+
+        if conn.select(f'"{IMAP_FOLDER}"', readonly=False)[0] != 'OK':
+            log.error(f'Could not select folder: {IMAP_FOLDER}')
+            return
+
+        status, data = conn.uid('search', None, f'NOT KEYWORD {PROCESSED_FLAG}')
+        if status != 'OK' or not data[0]:
+            log.info(f'Folder {IMAP_FOLDER}: No unprocessed messages.')
+            return
+
+        uids = data[0].split()
+        log.info(f'Folder {IMAP_FOLDER}: {len(uids)} unprocessed message(s)')
+
+        # Functional capability check — attempt to set and immediately remove a test flag.
+        # Fails fast if the server doesn't support custom IMAP keywords.
+        if not DRY_RUN:
+            test_status, _ = conn.uid('store', uids[0], '+FLAGS', CAPABILITY_FLAG)
+            if test_status != 'OK':
+                log.critical('IMAP server rejected custom keyword flags — cannot track state. Aborting.')
+                return
+            try:
+                conn.uid('store', uids[0], '-FLAGS', CAPABILITY_FLAG)
+            except Exception:
+                pass  # Non-fatal — flag will be ignored by processing logic
+
+        # State tracker deduplicates indicators across all messages in this run
+        state_tracker = {'ips': set(), 'domains': set(), 'urls': set(), 'emails': set()}
+
+        for uid in uids:
+            status, msg_data = conn.uid('fetch', uid, '(RFC822)')
+            if status != 'OK' or not msg_data or not msg_data[0]:
+                continue
+
+            raw_bytes = msg_data[0][1]
+            log.info(f'Processing message UID {uid.decode()}')
+
+            try:
+                process_message(raw_bytes, state_tracker)
+                total_processed += 1
+                if not DRY_RUN:
+                    # Flag the message as processed regardless of individual submission outcomes.
+                    # Design choice: a message is considered "examined" once parsed, not
+                    # "successfully submitted". This prevents reprocessing on transient API
+                    # failures and avoids duplicate submissions when the script retries.
+                    # Spamhaus 208 handles any re-submitted indicators gracefully.
+                    conn.uid('store', uid, '+FLAGS', PROCESSED_FLAG)
+                    log.info(f'  Flagged message UID {uid.decode()} as processed')
+            except Exception as e:
+                log.error(f'  Failed to process message UID {uid.decode()}: {e}')
+
+    finally:
+        log.info(f'Done. {total_processed} message(s) processed.')
+        if conn:
+            if total_processed:
+                try:
+                    check_submission_count()
+                except Exception as e:
+                    log.error(f'Could not fetch submission count: {e}')
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+def run_daemon(interval=300):
+    """Run continuously, checking every interval seconds."""
+    log.info(f'Daemon mode — checking every {interval}s')
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            log.error(f'Error in run loop: {e}')
+        log.info(f'Sleeping {interval}s...')
+        time.sleep(interval)
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Spam monitor and Spamhaus submitter')
+    parser.add_argument('--daemon', action='store_true', help='Run continuously')
+    parser.add_argument('--interval', type=int, default=300,
+                        help='Daemon check interval in seconds (default: 300)')
+    args = parser.parse_args()
+
+    if args.daemon:
+        run_daemon(args.interval)
+    else:
+        run_once()
