@@ -31,13 +31,11 @@ import email.policy
 import os
 import re
 import sys
-import json
 import time
 import logging
 import argparse
 import socket
 import ipaddress
-import urllib.request
 import requests
 from collections import defaultdict
 from email.utils import getaddresses
@@ -249,11 +247,15 @@ def rir_lookup(ip):
     if not ip:
         return {}
     try:
-        url = f'{RIR_API}?resource={ip}'
-        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        records = data.get('data', {}).get('records', [])
+        resp = requests.get(
+            RIR_API,
+            params={'resource': ip},
+            headers={'Accept': 'application/json'},
+            timeout=8
+        )
+        if not resp.ok:
+            return {}
+        records = resp.json().get('data', {}).get('records', [])
         result = {}
         for group in records:
             for record in group:
@@ -309,11 +311,11 @@ REASON_DOMAIN = 'Spam domain found in Junk folder.'
 REASON_URL    = 'Scam URL extracted from spam email body.'
 REASON_EMAIL  = 'Spam email found in Junk folder.'
 
-def spamhaus_request(endpoint, payload=None, method='POST', retries=3):
+def spamhaus_request(endpoint, payload=None, method='POST', rate_limit_retries=3):
     """Pure HTTP function. Makes a Spamhaus API call with retry on 429."""
     url     = f'{SPAMHAUS_API}/{endpoint}'
     headers = {'Authorization': f'Bearer {SPAMHAUS_TOKEN}'}
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, rate_limit_retries + 1):
         try:
             resp = requests.request(
                 method, url,
@@ -322,7 +324,7 @@ def spamhaus_request(endpoint, payload=None, method='POST', retries=3):
                 timeout=30
             )
             if resp.status_code == 429:
-                log.warning(f'Rate limited — waiting 60s (attempt {attempt}/{retries})')
+                log.warning(f'Rate limited — waiting 60s (attempt {attempt}/{rate_limit_retries})')
                 time.sleep(60)
                 continue
             elif resp.status_code == 208:
