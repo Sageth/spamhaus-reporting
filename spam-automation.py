@@ -7,14 +7,19 @@ and submits them to the Spamhaus API. Uses a custom IMAP flag for state
 tracking — no local database or flat files required.
 
 Required environment variables:
+    SPAMHAUS_TOKEN   — your Spamhaus submission API token
+
+    Single-mailbox mode (mutually exclusive with ACCOUNTS_CONFIG):
     IMAP_SERVER      — e.g. mail.example.com
     IMAP_PORT        — e.g. 993 (default)
     IMAP_USER        — your full email address
     IMAP_PASSWORD    — your IMAP password
-    SPAMHAUS_TOKEN   — your Spamhaus submission API token
+
+    Multi-mailbox mode:
+    ACCOUNTS_CONFIG  — path to a JSON file listing mailbox configs (see accounts.example.json)
 
 Optional environment variables:
-    IMAP_FOLDER      — folder to watch (default: Junk)
+    IMAP_FOLDER      — folder to watch (default: Junk); per-account override available in config file
     DRY_RUN          — set to "1" to parse without submitting (default: 0)
     DELAY            — seconds between API calls (default: 2)
     VERBOSE_LIST     — set to "1" to log every submission with its status (default: 0)
@@ -28,6 +33,7 @@ Usage:
 import imaplib
 import email
 import email.policy
+import json
 import os
 import re
 import sys
@@ -56,6 +62,7 @@ IMAP_FOLDER    = os.environ.get('IMAP_FOLDER', 'Junk')
 DRY_RUN        = os.environ.get('DRY_RUN', '0').strip() == '1'
 DELAY          = float(os.environ.get('DELAY', '2'))
 VERBOSE_LIST   = os.environ.get('VERBOSE_LIST', '0').strip() == '1'
+ACCOUNTS_CONFIG = os.environ.get('ACCOUNTS_CONFIG', '')
 
 SPAMHAUS_API    = 'https://submit.spamhaus.org/portal/api/v1'
 RIR_API         = 'https://stat.ripe.net/data/whois/data.json'
@@ -70,6 +77,30 @@ CAPABILITY_FLAG = '$SpamhausCapabilityTest'
 _TRACKING_PARAMS = frozenset({
     'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
     'fbclid', 'gclid', 'msclkid', 'mc_eid', 'mc_cid',
+})
+
+# Domains that should never be submitted to Spamhaus. Messages whose primary
+# domain or envelope domains match (or are a subdomain of) any entry here are
+# skipped entirely — flagged as processed but not submitted.
+DOMAIN_ALLOWLIST = frozenset({
+    'accounts.google.com',
+    'amazon.com',
+    'amazonaws.com',
+    'apple.com',
+    'cloudflare.com',
+    'github.com',
+    'gmail.com',
+    'google.com',
+    'googlemail.com',
+    'hotmail.com',
+    'icloud.com',
+    'live.com',
+    'mail.google.com',
+    'me.com',
+    'microsoft.com',
+    'outlook.com',
+    'paypal.com',
+    'stripe.com',
 })
 
 # Enforce a global socket timeout to prevent half-open TCP hangs
@@ -429,6 +460,15 @@ def process_message(raw_bytes, state_tracker):
     parsed = parse_message(raw_bytes)
     auth   = parsed['auth']
 
+    all_domains = parsed['envelope_domains'] | (
+        {parsed['primary_domain']} if parsed['primary_domain'] else set()
+    )
+    allowlisted = {d for d in all_domains
+                   if any(d == a or d.endswith('.' + a) for a in DOMAIN_ALLOWLIST)}
+    if allowlisted:
+        log.info(f'  Skipping — allowlisted domain(s): {", ".join(sorted(allowlisted))}')
+        return
+
     log.info(f'  IP={parsed["ip"]} primary_domain={parsed["primary_domain"]}')
     log.info(f'  Subject: {parsed["subject"]}')
     log.info(f'  Rspamd: {parsed["rspamd"]}')
@@ -473,47 +513,82 @@ def process_message(raw_bytes, state_tracker):
 # IMAP
 # ─────────────────────────────────────────────
 
-def connect_imap():
+def load_accounts():
+    """Return (spamhaus_token, accounts) from ACCOUNTS_CONFIG file, or fall back to env vars."""
+    if ACCOUNTS_CONFIG:
+        try:
+            with open(os.path.expandvars(os.path.expanduser(ACCOUNTS_CONFIG))) as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            log.error(f'Could not load ACCOUNTS_CONFIG {ACCOUNTS_CONFIG}: {e}')
+            sys.exit(1)
+        if not isinstance(config, dict):
+            log.error(f'ACCOUNTS_CONFIG must be a JSON object with "spamhaus_token" and "accounts" keys: {ACCOUNTS_CONFIG}')
+            sys.exit(1)
+        token    = config.get('spamhaus_token') or SPAMHAUS_TOKEN
+        accounts = config.get('accounts', [])
+        if not token:
+            log.error('No spamhaus_token in config file and SPAMHAUS_TOKEN env var is not set.')
+            sys.exit(1)
+        if not isinstance(accounts, list) or not accounts:
+            log.error(f'ACCOUNTS_CONFIG "accounts" must be a non-empty array: {ACCOUNTS_CONFIG}')
+            sys.exit(1)
+        for i, acct in enumerate(accounts):
+            for key in ('imap_server', 'imap_user', 'imap_password'):
+                if not acct.get(key):
+                    log.error(f'Account {i + 1} missing required field: {key}')
+                    sys.exit(1)
+        return token, accounts
+
+    if not all([IMAP_SERVER, IMAP_USER, IMAP_PASSWORD]):
+        log.error('Missing required environment variables: IMAP_SERVER, IMAP_USER, IMAP_PASSWORD '
+                  '(or set ACCOUNTS_CONFIG to a JSON config file).')
+        sys.exit(1)
+    return SPAMHAUS_TOKEN, [{'imap_server': IMAP_SERVER, 'imap_port': IMAP_PORT,
+                              'imap_user': IMAP_USER, 'imap_password': IMAP_PASSWORD,
+                              'imap_folder': IMAP_FOLDER}]
+
+
+def connect_imap(account):
     """Connect to IMAP server with explicit timeout to prevent half-open TCP hangs."""
-    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=60)
-    conn.login(IMAP_USER, IMAP_PASSWORD)
-    log.info(f'Connected to {IMAP_SERVER}:{IMAP_PORT} as {IMAP_USER}')
+    server   = account['imap_server']
+    port     = int(account.get('imap_port', 993))
+    user     = account['imap_user']
+    password = account['imap_password']
+    conn = imaplib.IMAP4_SSL(server, port, timeout=60)
+    conn.login(user, password)
+    log.info(f'Connected to {server}:{port} as {user}')
     return conn
 
-def run_once():
-    """Connect, process unprocessed messages in Junk, flag processed, disconnect."""
-    if not all([IMAP_SERVER, IMAP_USER, IMAP_PASSWORD, SPAMHAUS_TOKEN]):
-        log.error('Missing required environment variables.')
-        sys.exit(1)
 
-    if DRY_RUN:
-        log.info('*** DRY RUN mode — no submissions or flags will be applied ***')
-
-    conn = None
+def run_account(account):
+    """Process one mailbox: connect, process unprocessed messages, flag, disconnect. Returns count."""
+    folder = account.get('imap_folder', 'Junk')
+    conn   = None
     total_processed = 0
 
     try:
-        conn = connect_imap()
+        conn = connect_imap(account)
 
-        if conn.select(f'"{IMAP_FOLDER}"', readonly=False)[0] != 'OK':
-            log.error(f'Could not select folder: {IMAP_FOLDER}')
-            return
+        if conn.select(f'"{folder}"', readonly=False)[0] != 'OK':
+            log.error(f'Could not select folder: {folder}')
+            return 0
 
         status, data = conn.uid('search', None, f'NOT KEYWORD {PROCESSED_FLAG}')
         if status != 'OK' or not data[0]:
-            log.info(f'Folder {IMAP_FOLDER}: No unprocessed messages.')
-            return
+            log.info(f'Folder {folder}: No unprocessed messages.')
+            return 0
 
         uids = data[0].split()
-        log.info(f'Folder {IMAP_FOLDER}: {len(uids)} unprocessed message(s)')
+        log.info(f'Folder {folder}: {len(uids)} unprocessed message(s)')
 
         # Functional capability check — attempt to set and immediately remove a test flag.
         # Fails fast if the server doesn't support custom IMAP keywords.
         if not DRY_RUN:
             test_status, _ = conn.uid('store', uids[0], '+FLAGS', CAPABILITY_FLAG)
             if test_status != 'OK':
-                log.critical('IMAP server rejected custom keyword flags — cannot track state. Aborting.')
-                return
+                log.critical('IMAP server rejected custom keyword flags — cannot track state. Skipping account.')
+                return 0
             try:
                 conn.uid('store', uids[0], '-FLAGS', CAPABILITY_FLAG)
             except Exception:
@@ -547,15 +622,37 @@ def run_once():
     finally:
         log.info(f'Done. {total_processed} message(s) processed.')
         if conn:
-            if total_processed:
-                try:
-                    check_submission_count()
-                except Exception as e:
-                    log.error(f'Could not fetch submission count: {e}')
             try:
                 conn.logout()
             except Exception:
                 pass
+
+    return total_processed
+
+
+def run_once():
+    """Process all configured mailboxes once."""
+    if DRY_RUN:
+        log.info('*** DRY RUN mode — no submissions or flags will be applied ***')
+
+    token, accounts = load_accounts()
+    if not token:
+        log.error('Missing Spamhaus token — set SPAMHAUS_TOKEN or add "spamhaus_token" to ACCOUNTS_CONFIG.')
+        sys.exit(1)
+
+    # Allow the resolved token to be used by spamhaus_request() which reads SPAMHAUS_TOKEN
+    global SPAMHAUS_TOKEN
+    SPAMHAUS_TOKEN = token
+
+    grand_total = 0
+    for account in accounts:
+        grand_total += run_account(account)
+
+    if grand_total and not DRY_RUN:
+        try:
+            check_submission_count()
+        except Exception as e:
+            log.error(f'Could not fetch submission count: {e}')
 
 def run_daemon(interval=300):
     """Run continuously, checking every interval seconds."""

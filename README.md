@@ -36,7 +36,13 @@ pip install bs4 requests
 
 ## Configuration
 
-All settings via environment variables:
+**Required for all setups:**
+
+| Variable | Description |
+|---|---|
+| `SPAMHAUS_TOKEN` | Spamhaus submission API token |
+
+**Single-mailbox setup** — set these environment variables directly:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -44,11 +50,40 @@ All settings via environment variables:
 | `IMAP_PORT` | No | `993` | IMAP port |
 | `IMAP_USER` | Yes | — | Your full email address |
 | `IMAP_PASSWORD` | Yes | — | Your IMAP password |
-| `SPAMHAUS_TOKEN` | Yes | — | Spamhaus submission API token |
 | `IMAP_FOLDER` | No | `Junk` | Folder to watch |
-| `DRY_RUN` | No | `0` | Set to `1` to parse without submitting or flagging |
-| `DELAY` | No | `2` | Seconds between new API submissions |
-| `VERBOSE_LIST` | No | `0` | Set to `1` to log every submission with its status |
+
+**Multi-mailbox setup** — point `ACCOUNTS_CONFIG` at a JSON file outside the repository:
+
+| Variable | Description |
+|---|---|
+| `ACCOUNTS_CONFIG` | Absolute path to a JSON config file (see `accounts.example.json`) |
+
+Copy `accounts.example.json` to a location outside the repository (e.g. `~/.config/spamhaus-reporting/accounts.json`), fill in your credentials, and set `ACCOUNTS_CONFIG` to that path. The file must never be committed — keep it outside the repo entirely. When `ACCOUNTS_CONFIG` is set, `SPAMHAUS_TOKEN` does not need to be set as an env var.
+
+```json
+{
+  "spamhaus_token": "your_spamhaus_api_token",
+  "accounts": [
+    {
+      "imap_server": "mail.example.com",
+      "imap_port": 993,
+      "imap_user": "you@example.com",
+      "imap_password": "your_imap_password",
+      "imap_folder": "Junk"
+    }
+  ]
+}
+```
+
+Each account entry supports `imap_server`, `imap_port`, `imap_user`, `imap_password`, and `imap_folder`. `imap_port` and `imap_folder` are optional and default to `993` and `Junk`.
+
+**Behavior flags** (apply to all modes):
+
+| Variable | Default | Description |
+|---|---|---|
+| `DRY_RUN` | `0` | Set to `1` to parse without submitting or flagging |
+| `DELAY` | `2` | Seconds between new API submissions |
+| `VERBOSE_LIST` | `0` | Set to `1` to log every submission with its status |
 
 **Getting a Spamhaus API token:**
 
@@ -123,7 +158,9 @@ EnvironmentFile=%h/.config/spamhaus-reporting/env
 WantedBy=default.target
 ```
 
-Create the environment file at `~/.config/spamhaus-reporting/env`:
+Create the environment file at `~/.config/spamhaus-reporting/env`.
+
+Single-mailbox:
 
 ```bash
 IMAP_SERVER=mail.example.com
@@ -132,6 +169,13 @@ IMAP_USER=you@example.com
 IMAP_PASSWORD=your_imap_password
 SPAMHAUS_TOKEN=your_spamhaus_api_token
 IMAP_FOLDER=Junk
+DELAY=2
+```
+
+Multi-mailbox (copy `accounts.example.json` to this location and fill in credentials — token lives in the file):
+
+```bash
+ACCOUNTS_CONFIG=/home/you/.config/spamhaus-reporting/accounts.json
 DELAY=2
 ```
 
