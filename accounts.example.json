@@ -13,7 +13,8 @@
       "imap_port": 993,
       "imap_user": "you@gmail.com",
       "imap_password": "your_gmail_app_password",
-      "imap_folder": "Spam"
+      "imap_folder": "[Gmail]/Spam",
+      "_note": "Gmail requires an App Password (not your Google password): myaccount.google.com/apppasswords. Spam folder is [Gmail]/Spam, not Spam."
     }
   ]
 }
