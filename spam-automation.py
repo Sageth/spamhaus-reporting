@@ -79,6 +79,30 @@ _TRACKING_PARAMS = frozenset({
     'fbclid', 'gclid', 'msclkid', 'mc_eid', 'mc_cid',
 })
 
+# Domains that should never be submitted to Spamhaus. Messages whose primary
+# domain or envelope domains match (or are a subdomain of) any entry here are
+# skipped entirely — flagged as processed but not submitted.
+DOMAIN_ALLOWLIST = frozenset({
+    'accounts.google.com',
+    'amazon.com',
+    'amazonaws.com',
+    'apple.com',
+    'cloudflare.com',
+    'github.com',
+    'gmail.com',
+    'google.com',
+    'googlemail.com',
+    'hotmail.com',
+    'icloud.com',
+    'live.com',
+    'mail.google.com',
+    'me.com',
+    'microsoft.com',
+    'outlook.com',
+    'paypal.com',
+    'stripe.com',
+})
+
 # Enforce a global socket timeout to prevent half-open TCP hangs
 socket.setdefaulttimeout(60)
 
@@ -435,6 +459,15 @@ def process_message(raw_bytes, state_tracker):
     state_tracker deduplicates indicators across messages within a single run."""
     parsed = parse_message(raw_bytes)
     auth   = parsed['auth']
+
+    all_domains = parsed['envelope_domains'] | (
+        {parsed['primary_domain']} if parsed['primary_domain'] else set()
+    )
+    allowlisted = {d for d in all_domains
+                   if any(d == a or d.endswith('.' + a) for a in DOMAIN_ALLOWLIST)}
+    if allowlisted:
+        log.info(f'  Skipping — allowlisted domain(s): {", ".join(sorted(allowlisted))}')
+        return
 
     log.info(f'  IP={parsed["ip"]} primary_domain={parsed["primary_domain"]}')
     log.info(f'  Subject: {parsed["subject"]}')
