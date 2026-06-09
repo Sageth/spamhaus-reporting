@@ -23,7 +23,7 @@ For each unprocessed message in your Junk folder, the script:
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - A Spamhaus Threat Intel Community account and API token
 - An IMAP mail account with Junk folder access
 - IMAP server that supports custom keyword flags (Dovecot, Cyrus, Gmail — most modern providers)
