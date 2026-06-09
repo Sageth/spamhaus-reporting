@@ -173,39 +173,42 @@ def extract_sending_ip(msg):
                 return ip
     return None
 
-def extract_envelope_domains(msg):
-    """Extract all unique IDNA-normalized domains from envelope headers and DKIM signature.
-    Uses email.utils.getaddresses for RFC-compliant address parsing.
-    DKIM d= is often the most reliable indicator — identifies signing domain
-    regardless of what From claims."""
+def _header_domains(msg, field):
+    """IDNA-normalized domains from the addresses in a header field."""
     domains = set()
-
-    for field in ('From', 'Reply-To', 'Return-Path'):
-        # Cast to str — email.policy.default returns header objects not raw strings
-        headers_raw = [str(h) for h in (msg.get_all(field) or [])]
-        for _, addr in getaddresses(headers_raw):
-            if '@' in addr:
-                domain = _normalize_domain(addr.rsplit('@', 1)[1])
-                if domain:
-                    domains.add(domain)
-
-    for dkim_header in msg.get_all('DKIM-Signature') or []:
-        flat = re.sub(r'\s+', '', str(dkim_header))
-        match = re.search(r'\bd=([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', flat, re.IGNORECASE)
-        if match:
-            domains.add(_normalize_domain(match.group(1)))
-
+    # Cast to str — email.policy.default returns header objects not raw strings
+    headers_raw = [str(h) for h in (msg.get_all(field) or [])]
+    for _, addr in getaddresses(headers_raw):
+        if '@' in addr:
+            domain = _normalize_domain(addr.rsplit('@', 1)[1])
+            if domain:
+                domains.add(domain)
     return domains
 
-def extract_primary_domain(msg):
-    """Extract the primary sending domain, preferring DKIM d= over Return-Path.
-    DKIM d= identifies the signing domain regardless of what From claims.
-    Falls back to Return-Path domain if no DKIM signature is present."""
-    for dkim_header in msg.get_all('DKIM-Signature') or []:
-        flat = re.sub(r'\s+', '', str(dkim_header))
-        match = re.search(r'\bd=([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', flat, re.IGNORECASE)
-        if match:
-            return _normalize_domain(match.group(1))
+def extract_envelope_domains(msg, dkim_domains):
+    """Extract all unique IDNA-normalized sending domains.
+    Combines the claimed envelope/header domains (From, Reply-To, Return-Path)
+    with the DKIM signing domains our MTA actually verified (dkim_domains).
+    Raw DKIM-Signature d= tags are intentionally not read — they are unverified
+    and forgeable; see extract_auth_results."""
+    domains = set(dkim_domains)
+    for field in ('From', 'Reply-To', 'Return-Path'):
+        domains |= _header_domains(msg, field)
+    return domains
+
+def extract_primary_domain(msg, dkim_domains):
+    """Extract the primary sending domain, preferring a DKIM signing domain our
+    MTA verified (Authentication-Results dkim=pass header.d=) over the Return-Path
+    claim. A verified signer is the accountable origin and cannot be a forged
+    third party. When several signers verified, prefer the one aligned with the
+    From domain, else pick deterministically. Falls back to Return-Path when
+    nothing was DKIM-verified."""
+    if dkim_domains:
+        from_domains = _header_domains(msg, 'From')
+        aligned = sorted(d for d in dkim_domains
+                         if any(d == f or d.endswith('.' + f) or f.endswith('.' + d)
+                                for f in from_domains))
+        return aligned[0] if aligned else sorted(dkim_domains)[0]
 
     headers_raw = [str(h) for h in (msg.get_all('Return-Path') or [])]
     for _, addr in getaddresses(headers_raw):
@@ -217,10 +220,17 @@ def extract_primary_domain(msg):
 def extract_auth_results(msg):
     """Extract SPF, DKIM, DMARC results from Authentication-Results header.
     Uses the top-most header (written by our MTA), strips line folding,
-    and extracts the first result per type."""
+    and extracts the first result per type.
+
+    Also returns 'dkim_domains': the set of signing domains our MTA actually
+    verified (header.d= on a dkim=pass result). These are the only DKIM domains
+    we trust — raw DKIM-Signature d= tags are unverified claims and can be forged
+    to frame a third party, so they are deliberately not used."""
+    empty = {'spf': 'unknown', 'dkim': 'unknown', 'dmarc': 'unknown',
+             'dmarc_policy': 'unknown', 'dkim_domains': set()}
     auth_headers = msg.get_all('Authentication-Results') or []
     if not auth_headers:
-        return {'spf': 'unknown', 'dkim': 'unknown', 'dmarc': 'unknown', 'dmarc_policy': 'unknown'}
+        return empty
 
     # Top-most header is from our MTA — flatten line folding
     auth = re.sub(r'\s+', ' ', str(auth_headers[0]))
@@ -232,9 +242,24 @@ def extract_auth_results(msg):
     spf          = extract(r'\bspf=(pass|fail|softfail|neutral|none|permerror|temperror)\b')
     dkim         = extract(r'\bdkim=(pass|fail|none|policy|neutral|temperror|permerror)\b')
     dmarc        = extract(r'\bdmarc=(pass|fail|none|bestguesspass|temperror|permerror)\b')
+    # p= legitimately lives inside the DMARC comment "(p=none ...)", so policy is
+    # read from the comment-bearing string.
     dmarc_policy = extract(r'\b(?:policy\.[A-Za-z_-]*|p)=([A-Za-z]+)')
 
-    return {'spf': spf, 'dkim': dkim, 'dmarc': dmarc, 'dmarc_policy': dmarc_policy}
+    # Strip parenthetical comments before splitting on ';' — comments may contain
+    # ';' (e.g. "(1024-bit key; unprotected)") which would corrupt the split.
+    dkim_domains = set()
+    for chunk in re.sub(r'\([^)]*\)', ' ', auth).split(';'):
+        if re.search(r'\bdkim=pass\b', chunk, re.IGNORECASE):
+            dm = (re.search(r'header\.d=([a-zA-Z0-9.-]+)', chunk, re.IGNORECASE) or
+                  re.search(r'header\.i=(?:[^@\s]*@)?([a-zA-Z0-9.-]+)', chunk, re.IGNORECASE))
+            if dm:
+                domain = _normalize_domain(dm.group(1).strip('.'))
+                if domain:
+                    dkim_domains.add(domain)
+
+    return {'spf': spf, 'dkim': dkim, 'dmarc': dmarc,
+            'dmarc_policy': dmarc_policy, 'dkim_domains': dkim_domains}
 
 def normalize_url(href):
     """Strip tracking parameters, sort remaining params, lowercase hostname,
@@ -258,6 +283,24 @@ def normalize_url(href):
     except Exception:
         return None
 
+# Tokens that mark a link as an unsubscribe/opt-out endpoint (structural, not a
+# malicious payload). Matched against host labels, path segments, and query-key
+# names only — not the raw href — so a path like /remove-hold is not mistaken for
+# one. 'remove' is intentionally excluded: too generic, it false-matched here.
+_UNSUB_TOKENS = ('unsub', 'optout', 'opt-out', 'opt_out')
+
+def _is_unsubscribe_link(href):
+    """True if the URL looks like an unsubscribe/opt-out endpoint, judged from its
+    host labels, path segments, and query-parameter names (boundary-aware)."""
+    try:
+        parsed = urlparse(href)
+    except ValueError:
+        return False
+    candidates = [label for label in (parsed.hostname or '').lower().split('.') if label]
+    candidates += [seg.lower() for seg in parsed.path.split('/') if seg]
+    candidates += [k.lower() for k, _ in parse_qsl(parsed.query)]
+    return any(tok in cand for cand in candidates for tok in _UNSUB_TOKENS)
+
 def extract_cta_urls(msg):
     """Extract action URLs from HTML body. Strips tracking parameters and skips
     unsubscribe/optout links which are structural, not malicious endpoints."""
@@ -272,7 +315,7 @@ def extract_cta_urls(msg):
                     href = a['href'].strip()
                     if not href.startswith(('http://', 'https://')):
                         continue
-                    if any(s in href.lower() for s in ('unsub', 'optout', 'opt-out', 'remove', 'list-unsubscribe')):
+                    if _is_unsubscribe_link(href):
                         continue
                     normalized = normalize_url(href)
                     if normalized:
@@ -317,12 +360,12 @@ def parse_message(raw_bytes, policy=email.policy.default):
     compat32 policy (see the fallback ladder in process_message)."""
     msg = email.message_from_bytes(raw_bytes, policy=policy)
 
-    ip               = extract_sending_ip(msg)
-    envelope_domains = extract_envelope_domains(msg)
-    urls             = extract_cta_urls(msg)
+    # auth first — its MTA-verified dkim_domains feed domain extraction
     auth             = extract_auth_results(msg)
-
-    primary_domain = extract_primary_domain(msg)
+    ip               = extract_sending_ip(msg)
+    envelope_domains = extract_envelope_domains(msg, auth['dkim_domains'])
+    urls             = extract_cta_urls(msg)
+    primary_domain   = extract_primary_domain(msg, auth['dkim_domains'])
 
     return {
         'ip':               ip,
