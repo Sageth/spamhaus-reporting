@@ -87,6 +87,9 @@ DOMAIN_ALLOWLIST = frozenset({
     'amazon.com',
     'amazonaws.com',
     'apple.com',
+    'bankofamerica.com',
+    'capitalone.com',
+    'chase.com',
     'cloudflare.com',
     'github.com',
     'gmail.com',
@@ -94,6 +97,7 @@ DOMAIN_ALLOWLIST = frozenset({
     'googlemail.com',
     'hotmail.com',
     'icloud.com',
+    'jpmorgan.com',
     'live.com',
     'mail.google.com',
     'me.com',
@@ -102,6 +106,7 @@ DOMAIN_ALLOWLIST = frozenset({
     'paypal.com',
     'reddit.com',
     'stripe.com',
+    'wellsfargo.com',
 })
 
 # Enforce a global socket timeout to prevent half-open TCP hangs
