@@ -136,6 +136,10 @@ def _normalize_domain(domain):
     except Exception:
         return domain.strip().lower()
 
+def _is_allowlisted(domain):
+    """Return True if domain exactly matches or is a subdomain of any allowlist entry."""
+    return any(domain == a or domain.endswith('.' + a) for a in DOMAIN_ALLOWLIST)
+
 def _is_internal_ip(ip):
     """Return True if the IP string is loopback, private, link-local, or reserved."""
     try:
@@ -469,8 +473,7 @@ def process_message(raw_bytes, state_tracker):
     all_domains = parsed['envelope_domains'] | (
         {parsed['primary_domain']} if parsed['primary_domain'] else set()
     )
-    allowlisted = {d for d in all_domains
-                   if any(d == a or d.endswith('.' + a) for a in DOMAIN_ALLOWLIST)}
+    allowlisted = {d for d in all_domains if _is_allowlisted(d)}
     if allowlisted:
         log.info(f'  Skipping — allowlisted domain(s): {", ".join(sorted(allowlisted))}')
         return
@@ -502,18 +505,27 @@ def process_message(raw_bytes, state_tracker):
         submit('email', key, email_sample, THREAT_EMAIL, REASON_EMAIL)
 
     for url in parsed['urls']:
+        try:
+            hostname = _normalize_domain(urlparse(url).hostname or '')
+        except Exception as e:
+            log.debug(f'Could not extract hostname from URL: {e}')
+            hostname = ''
+
+        # Allowlisted hosts (real brand sites, redirectors, CDNs that legit mail
+        # also links to) must not be reported — skip the URL and its landing domain.
+        if hostname and _is_allowlisted(hostname):
+            log.info(f'  Skipping allowlisted URL host: {hostname}')
+            continue
+
         if url not in state_tracker['urls']:
             state_tracker['urls'].add(url)
             submit('url', url, url, THREAT_URL, REASON_URL)
+
         # Submit landing domain from URL if not already seen
-        try:
-            hostname = _normalize_domain(urlparse(url).hostname or '')
-            if hostname and hostname not in parsed['envelope_domains'] and hostname not in state_tracker['domains']:
-                state_tracker['domains'].add(hostname)
-                submit('domain', hostname, hostname, THREAT_DOMAIN,
-                       f'Landing domain extracted from spam URL. {REASON_DOMAIN}')
-        except Exception as e:
-            log.debug(f'Could not extract landing domain from URL: {e}')
+        if hostname and hostname not in parsed['envelope_domains'] and hostname not in state_tracker['domains']:
+            state_tracker['domains'].add(hostname)
+            submit('domain', hostname, hostname, THREAT_DOMAIN,
+                   f'Landing domain extracted from spam URL. {REASON_DOMAIN}')
 
 # ─────────────────────────────────────────────
 # IMAP
