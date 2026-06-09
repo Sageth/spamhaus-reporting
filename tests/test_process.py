@@ -3,22 +3,7 @@
 submit() and rir_lookup() are patched so no network calls happen; we record
 the (submission_type, object) of every submission the run would make.
 """
-import pytest
-
 from conftest import spam
-
-
-@pytest.fixture
-def captured_submissions(monkeypatch):
-    """Patch submit/rir_lookup and return the list of (type, object) submitted."""
-    calls = []
-
-    def fake_submit(submission_type, key, object_value, threat_type, reason):
-        calls.append((submission_type, object_value))
-
-    monkeypatch.setattr(spam, 'submit', fake_submit)
-    monkeypatch.setattr(spam, 'rir_lookup', lambda ip: {})
-    return calls
 
 
 def _fresh_tracker():

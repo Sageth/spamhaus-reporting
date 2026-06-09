@@ -31,3 +31,17 @@ def eml():
     def _load(name):
         return (FIXTURES / name).read_bytes()
     return _load
+
+
+@pytest.fixture
+def captured_submissions(monkeypatch):
+    """Patch submit/rir_lookup (no network) and return a list of (type, object)
+    tuples recording every submission a run would make."""
+    calls = []
+
+    def fake_submit(submission_type, key, object_value, threat_type, reason):
+        calls.append((submission_type, object_value))
+
+    monkeypatch.setattr(spam, 'submit', fake_submit)
+    monkeypatch.setattr(spam, 'rir_lookup', lambda ip: {})
+    return calls

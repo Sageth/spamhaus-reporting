@@ -13,9 +13,10 @@ For each unprocessed message in your Junk folder, the script:
 - Extracts the sending IP from the topmost `Received-SPF` header
 - Extracts sending domains from `From`, `Reply-To`, `Return-Path`, and `DKIM-Signature d=`
 - Extracts and normalizes CTA URLs from the HTML body
+- Skips any indicator (sending domain, URL, or URL landing domain) matching the built-in domain allowlist
 - Looks up the sending IP against RIPE Stat for infrastructure context
 - Submits IP, domains, URLs, and a raw email sample to the Spamhaus API
-- Flags the message as processed on the mail server
+- Flags the message as processed on the mail server (or as failed if it can't be parsed)
 - Deduplicates indicators within each run via an in-memory state tracker
 - Logs a grouped submission summary after each run that processes messages
 
@@ -103,7 +104,7 @@ curl -s -H "Authorization: Bearer $SPAMHAUS_TOKEN" \
 **Always dry run first:**
 
 ```bash
-DRY_RUN=1 python3 spam-monitor.py
+DRY_RUN=1 python3 spam-automation.py
 ```
 
 This parses every unprocessed message and logs what would be submitted without touching the API or setting any flags. Check the output before running live.
@@ -111,25 +112,25 @@ This parses every unprocessed message and logs what would be submitted without t
 **Single run:**
 
 ```bash
-python3 spam-monitor.py
+python3 spam-automation.py
 ```
 
 **Daemon mode (checks every 5 minutes):**
 
 ```bash
-python3 spam-monitor.py --daemon --interval 300
+python3 spam-automation.py --daemon --interval 300
 ```
 
 **Cron job (every 10 minutes):**
 
 ```
-*/10 * * * * cd /path/to/spamhaus-reporting && python3 spam-monitor.py
+*/10 * * * * cd /path/to/spamhaus-reporting && python3 spam-automation.py
 ```
 
 **Full submission detail:**
 
 ```bash
-VERBOSE_LIST=1 python3 spam-monitor.py
+VERBOSE_LIST=1 python3 spam-automation.py
 ```
 
 ---
@@ -160,7 +161,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/path/to/spamhaus-reporting
-ExecStart=/usr/bin/python3 spam-monitor.py --daemon --interval 300
+ExecStart=/usr/bin/python3 spam-automation.py --daemon --interval 300
 Restart=on-failure
 RestartSec=30
 EnvironmentFile=%h/.config/spamhaus-reporting/env
@@ -230,6 +231,8 @@ On startup, the script runs a functional capability test — it attempts to set 
 
 A message is flagged as processed once examined, regardless of whether individual API submissions succeeded. Spamhaus returns HTTP 208 for already-known indicators, which handles any cross-run duplicates gracefully.
 
+A message that cannot be parsed is retried through an escalating fallback ladder within the same run — strict parse, then the lenient `compat32` parse, then a last-resort attempt that salvages just the sending IP straight from the raw bytes. If every step fails, the message is flagged `$SpamhausFailed` rather than `$SpamhausProcessed`, so it is excluded from future runs (no infinite reprocessing) yet stays visibly distinct from cleanly-processed mail for inspection.
+
 ---
 
 ## Sample output
@@ -260,11 +263,15 @@ A message is flagged as processed once examined, regardless of whether individua
 
 ## Known limitations
 
-**IP extraction requires `Received-SPF`.** The script extracts IPs only from the topmost `Received-SPF` header, written by your MTA on arrival. If that header is absent, no IP is submitted. The `Received` chain is not used as a fallback because it risks reporting legitimate forwarding infrastructure.
+**IP extraction requires `Received-SPF`.** The script reads `client-ip=` from the topmost `Received-SPF` header — the SPF evaluation your inbound MX recorded for the host that actually connected to it. For directly-delivered mail this is the true sending source; for mail relayed through a forwarder it is the forwarder's IP (where SPF has usually already failed), so the script can surface forwarding infrastructure on forwarded spam. The IP is submitted regardless of the SPF result. If the header is absent, no IP is submitted, and the lower `Received` chain is deliberately not used as a fallback — those hops are both forgeable and more likely to be legitimate relays.
 
-**Domains from envelope headers may include spoofed legitimate domains.** If a message spoofs a well-known brand in the `From` header and your server doesn't drop it, the script will attempt to report that domain. Spamhaus's analyst review process handles false positives.
+**Header trust assumes your MX sanitizes inbound headers.** Both the IP and the SPF/DKIM/DMARC results are read from the *topmost* `Received-SPF` and `Authentication-Results` headers on the assumption they were stamped by your own inbound MX. That assumption holds only if your MX strips or overwrites any pre-existing copies of those headers; if it does not, a sender can forge a top header and influence what is extracted. The script does not validate the `authserv-id` against your domain.
 
-**URL landing domains may be legitimate redirectors.** CDN hostnames, link shorteners, and ESP tracking domains sometimes appear in spam. The script submits them — whether that adds intelligence value depends on the campaign.
+**Domains from envelope headers may include spoofed legitimate domains.** If a message spoofs a well-known brand in the `From` header and your server doesn't drop it, the script will attempt to report that domain — unless the domain is in the built-in allowlist (`DOMAIN_ALLOWLIST` in the script), which is matched against sending domains, URLs, and URL landing domains and skips them entirely. For brands not in the allowlist, Spamhaus's analyst review process handles false positives.
+
+**URL landing domains may be legitimate redirectors.** CDN hostnames, link shorteners, and ESP tracking domains sometimes appear in spam. The script submits them — unless they match the allowlist — so whether a non-allowlisted redirector adds intelligence value depends on the campaign.
+
+**Allowlisting is exact-or-subdomain only.** A domain is skipped when it equals an allowlist entry or is a subdomain of one (e.g. `mail.google.com` matches `google.com`). Lookalikes such as `evil-paypal.com` are intentionally not matched. Edit `DOMAIN_ALLOWLIST` in the script to tune it.
 
 **IMAP keyword support varies.** Most modern servers support custom keywords. Some hosted providers don't. The script tests for support at startup and aborts if the server rejects the flag.
 

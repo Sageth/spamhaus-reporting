@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-spam-monitor.py — Automated spam analysis and Spamhaus submission
+spam-automation.py — Automated spam analysis and Spamhaus submission
 
 Monitors an IMAP Junk folder for spam, extracts infrastructure indicators,
 and submits them to the Spamhaus API. Uses a custom IMAP flag for state
@@ -25,9 +25,9 @@ Optional environment variables:
     VERBOSE_LIST     — set to "1" to log every submission with its status (default: 0)
 
 Usage:
-    python3 spam-monitor.py             # run once
-    python3 spam-monitor.py --daemon    # run continuously
-    DRY_RUN=1 python3 spam-monitor.py   # dry run
+    python3 spam-automation.py             # run once
+    python3 spam-automation.py --daemon    # run continuously
+    DRY_RUN=1 python3 spam-automation.py   # dry run
 """
 
 import imaplib
@@ -72,6 +72,9 @@ RIR_API         = 'https://stat.ripe.net/data/whois/data.json'
 # Spamhaus 208 ("already reported") handles any indicator duplicates across runs.
 PROCESSED_FLAG  = '$SpamhausProcessed'
 CAPABILITY_FLAG = '$SpamhausCapabilityTest'
+# Set when every parse attempt (strict → lenient → minimal) fails, so a poison
+# message is not retried forever yet stays visibly distinct from clean mail.
+FAILED_FLAG     = '$SpamhausFailed'
 
 # Tracking parameters appended by spam campaigns to generate unique URLs per recipient.
 _TRACKING_PARAMS = frozenset({
@@ -308,9 +311,11 @@ def rir_lookup(ip):
         log.debug(f'RIR lookup failed for {ip}: {e}')
         return {}
 
-def parse_message(raw_bytes):
-    """Parse a raw email and extract all indicators."""
-    msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+def parse_message(raw_bytes, policy=email.policy.default):
+    """Parse a raw email and extract all indicators.
+    policy is overridable so callers can retry malformed mail under the lenient
+    compat32 policy (see the fallback ladder in process_message)."""
+    msg = email.message_from_bytes(raw_bytes, policy=policy)
 
     ip               = extract_sending_ip(msg)
     envelope_domains = extract_envelope_domains(msg)
@@ -464,10 +469,10 @@ def check_submission_count():
 # PROCESSING
 # ─────────────────────────────────────────────
 
-def process_message(raw_bytes, state_tracker):
-    """Parse a message and submit indicators to Spamhaus.
-    state_tracker deduplicates indicators across messages within a single run."""
-    parsed = parse_message(raw_bytes)
+def submit_parsed(parsed, raw_bytes, state_tracker):
+    """Submit the indicators from an already-parsed message to Spamhaus.
+    Allowlisted senders are skipped entirely. state_tracker deduplicates
+    indicators across messages within a single run."""
     auth   = parsed['auth']
 
     all_domains = parsed['envelope_domains'] | (
@@ -526,6 +531,75 @@ def process_message(raw_bytes, state_tracker):
             state_tracker['domains'].add(hostname)
             submit('domain', hostname, hostname, THREAT_DOMAIN,
                    f'Landing domain extracted from spam URL. {REASON_DOMAIN}')
+
+
+def _salvage_ip(raw_bytes):
+    """Pull the sending IP straight from raw bytes when structured parsing fails.
+    Matches the topmost Received-SPF header (including folded continuation lines)
+    and extracts its client-ip, mirroring extract_sending_ip's trust model."""
+    text = raw_bytes.decode('utf-8', errors='replace')
+    header = re.search(r'^Received-SPF:[^\n]*(?:\n[ \t][^\n]*)*', text,
+                       re.IGNORECASE | re.MULTILINE)
+    if not header:
+        return None
+    match = re.search(r'client-ip=([0-9a-fA-F.:]+)', header.group(0))
+    if match:
+        ip = match.group(1).strip()
+        if not _is_internal_ip(ip):
+            return ip
+    return None
+
+
+def _attempt_strict(raw_bytes, state_tracker):
+    submit_parsed(parse_message(raw_bytes, policy=email.policy.default),
+                  raw_bytes, state_tracker)
+
+
+def _attempt_lenient(raw_bytes, state_tracker):
+    submit_parsed(parse_message(raw_bytes, policy=email.policy.compat32),
+                  raw_bytes, state_tracker)
+
+
+def _attempt_minimal(raw_bytes, state_tracker):
+    """Last resort: salvage only the sending IP via regex on the raw bytes."""
+    parsed = {
+        'ip':               _salvage_ip(raw_bytes),
+        'primary_domain':   None,
+        'envelope_domains': set(),
+        'urls':             [],
+        'auth':             {'spf': 'unknown', 'dkim': 'unknown',
+                             'dmarc': 'unknown', 'dmarc_policy': 'unknown'},
+        'subject':          '',
+        'rspamd':           'N/A',
+    }
+    submit_parsed(parsed, raw_bytes, state_tracker)
+
+
+def process_message(raw_bytes, state_tracker):
+    """Parse a message and submit its indicators, escalating through the fallback
+    ladder on failure. Returns 'processed' if any attempt completed (even if it
+    salvaged nothing), or 'failed' if every attempt raised — the caller flags
+    failures distinctly so they are not retried forever.
+
+    Escalating ladder: strict parse → lenient (compat32) parse → raw-bytes IP
+    salvage, each tolerating more malformation than the last. dedup via
+    state_tracker means a step that partially submitted before raising is not
+    re-submitted by the next step."""
+    attempts = (
+        ('strict',  _attempt_strict),
+        ('lenient', _attempt_lenient),
+        ('minimal', _attempt_minimal),
+    )
+    for name, attempt in attempts:
+        try:
+            attempt(raw_bytes, state_tracker)
+            if name != 'strict':
+                log.warning(f'  Parsed via {name} fallback')
+            return 'processed'
+        except Exception as e:
+            log.warning(f'  {name} parse attempt failed: {e}')
+    log.error('  All parse attempts failed — flagging message as failed')
+    return 'failed'
 
 # ─────────────────────────────────────────────
 # IMAP
@@ -592,7 +666,8 @@ def run_account(account):
             log.error(f'Could not select folder: {folder}')
             return 0
 
-        status, data = conn.uid('search', None, f'NOT KEYWORD {PROCESSED_FLAG}')
+        status, data = conn.uid('search', None,
+                                 f'NOT KEYWORD {PROCESSED_FLAG} NOT KEYWORD {FAILED_FLAG}')
         if status != 'OK' or not data[0]:
             log.info(f'Folder {folder}: No unprocessed messages.')
             return 0
@@ -624,16 +699,18 @@ def run_account(account):
             log.info(f'Processing message UID {uid.decode()}')
 
             try:
-                process_message(raw_bytes, state_tracker)
+                result = process_message(raw_bytes, state_tracker)
                 total_processed += 1
                 if not DRY_RUN:
-                    # Flag the message as processed regardless of individual submission outcomes.
-                    # Design choice: a message is considered "examined" once parsed, not
-                    # "successfully submitted". This prevents reprocessing on transient API
-                    # failures and avoids duplicate submissions when the script retries.
-                    # Spamhaus 208 handles any re-submitted indicators gracefully.
-                    conn.uid('store', uid, '+FLAGS', PROCESSED_FLAG)
-                    log.info(f'  Flagged message UID {uid.decode()} as processed')
+                    # Flag once examined, regardless of individual submission outcomes.
+                    # Design choice: a message is "examined" once parsed, not "successfully
+                    # submitted" — this prevents reprocessing on transient API failures and
+                    # avoids duplicate submissions on retry (Spamhaus 208 handles re-submits).
+                    # A message whose every parse attempt failed gets FAILED_FLAG instead, so
+                    # it is not retried forever yet stays distinct from cleanly-processed mail.
+                    flag = PROCESSED_FLAG if result == 'processed' else FAILED_FLAG
+                    conn.uid('store', uid, '+FLAGS', flag)
+                    log.info(f'  Flagged message UID {uid.decode()} as {result}')
             except Exception as e:
                 log.error(f'  Failed to process message UID {uid.decode()}: {e}')
 
