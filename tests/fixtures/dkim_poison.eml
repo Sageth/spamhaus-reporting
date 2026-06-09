@@ -1,0 +1,11 @@
+Received-SPF: pass (mail.example.com: domain of spammer-xyz.lat designates 203.0.113.55 as permitted sender) client-ip=203.0.113.55;
+Authentication-Results: mail.example.com; spf=pass smtp.mailfrom=spammer-xyz.lat; dkim=fail header.d=bigbank.com; dmarc=fail (p=none) header.from=spammer-xyz.lat
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=bigbank.com;
+ s=sel; h=from:subject; bh=abc; b=Zm9yZ2Vkc2lnbmF0dXJl
+From: "Account Team" <alert@spammer-xyz.lat>
+Return-Path: <bounce@spammer-xyz.lat>
+Subject: Verify your account
+Content-Type: text/plain; charset=utf-8
+
+A forged DKIM-Signature claims d=bigbank.com but the signature does not
+verify, so our MTA recorded dkim=fail. bigbank.com must never be reported.

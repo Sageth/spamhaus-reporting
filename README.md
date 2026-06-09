@@ -11,7 +11,7 @@ No local database or flat files required — state is tracked via a custom IMAP 
 For each unprocessed message in your Junk folder, the script:
 
 - Extracts the sending IP from the topmost `Received-SPF` header
-- Extracts sending domains from `From`, `Reply-To`, `Return-Path`, and `DKIM-Signature d=`
+- Extracts sending domains from `From`, `Reply-To`, `Return-Path`, and the DKIM signing domain your MTA *verified* (`Authentication-Results` `dkim=pass header.d=`)
 - Extracts and normalizes CTA URLs from the HTML body
 - Skips any indicator (sending domain, URL, or URL landing domain) matching the built-in domain allowlist
 - Looks up the sending IP against RIPE Stat for infrastructure context
@@ -267,7 +267,11 @@ A message that cannot be parsed is retried through an escalating fallback ladder
 
 **Header trust assumes your MX sanitizes inbound headers.** Both the IP and the SPF/DKIM/DMARC results are read from the *topmost* `Received-SPF` and `Authentication-Results` headers on the assumption they were stamped by your own inbound MX. That assumption holds only if your MX strips or overwrites any pre-existing copies of those headers; if it does not, a sender can forge a top header and influence what is extracted. The script does not validate the `authserv-id` against your domain.
 
-**Domains from envelope headers may include spoofed legitimate domains.** If a message spoofs a well-known brand in the `From` header and your server doesn't drop it, the script will attempt to report that domain — unless the domain is in the built-in allowlist (`DOMAIN_ALLOWLIST` in the script), which is matched against sending domains, URLs, and URL landing domains and skips them entirely. For brands not in the allowlist, Spamhaus's analyst review process handles false positives.
+**`From` / `Reply-To` / `Return-Path` domains are unverified claims.** These header domains are reported as-is, so a message spoofing a well-known brand in `From` (on mail that fails or lacks DMARC) can lead the script to report that brand's domain. The built-in allowlist (`DOMAIN_ALLOWLIST`) is the safety net for known brands — it is matched against sending domains, URLs, and URL landing domains and skips them entirely; for other brands, Spamhaus's analyst review handles false positives.
+
+**DKIM signing domains are taken only from your MTA's verified result.** The signing domain is read from `Authentication-Results` `dkim=pass header.d=` — i.e. a signature your MX *cryptographically verified* — never from the raw `DKIM-Signature` header. A raw `d=` tag is an unverified claim that anyone can forge (e.g. stapling `d=yourbank.com` with a bogus signature to frame a third party); trusting only verified results closes that poisoning vector while still capturing the spammer's real signing domain.
+
+**Authentication status is not used to exclude submissions.** A message passing SPF/DKIM/DMARC is *authenticated*, not *legitimate* — spammers routinely authenticate mail sent from their own throwaway domains. A verified domain is in fact the most confidently-reportable indicator (it is provably accountable and cannot be a framed victim). The "unwanted" signal here is simply that the message is in the Junk folder; legitimacy is handled by the allowlist, not by auth results.
 
 **URL landing domains may be legitimate redirectors.** CDN hostnames, link shorteners, and ESP tracking domains sometimes appear in spam. The script submits them — unless they match the allowlist — so whether a non-allowlisted redirector adds intelligence value depends on the campaign.
 

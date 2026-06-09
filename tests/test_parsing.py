@@ -70,6 +70,21 @@ def test_normalize_url_returns_none_on_garbage(bad):
     assert spam.normalize_url(bad) is None
 
 
+# ── _is_unsubscribe_link (boundary-aware, not raw substring) ───────
+
+@pytest.mark.parametrize('href, is_unsub', [
+    ('https://x.com/unsubscribe?u=1', True),     # path segment
+    ('https://x.com/manage/opt-out', True),      # hyphenated segment
+    ('https://x.com/p?optout=1', True),          # query-key name
+    ('https://optout.mailer.example/x', True),   # host label
+    ('https://x.com/account/remove-hold?id=9', False),  # the false-skip we fixed
+    ('https://x.com/remove-item', False),        # 'remove' is no longer a token
+    ('https://x.com/go?action=continue', False), # ordinary CTA
+])
+def test_is_unsubscribe_link(href, is_unsub):
+    assert spam._is_unsubscribe_link(href) is is_unsub
+
+
 # ── header extraction (fixtures) ───────────────────────────────────
 
 def test_extract_sending_ip_from_spf(eml):
@@ -112,3 +127,33 @@ def test_cta_urls_strip_tracking_and_skip_unsubscribe(eml):
     assert 'https://rewardsclaim.lat/go?id=42' in urls
     assert 'https://track.rewardsclaim.lat/click' in urls
     assert not any('unsubscribe' in u for u in urls)
+
+
+# ── verified DKIM domains (trust the MTA, not the raw signature) ────
+
+def test_auth_results_capture_verified_dkim_domain(eml):
+    parsed = spam.parse_message(eml('spam_basic.eml'))
+    assert parsed['auth']['dkim_domains'] == {'rewardsclaim.lat'}
+
+
+def test_forged_dkim_domain_on_failed_signature_is_not_used(eml):
+    # The message carries a raw DKIM-Signature d=bigbank.com, but our MTA
+    # recorded dkim=fail — so bigbank.com is unverified and must not appear.
+    parsed = spam.parse_message(eml('dkim_poison.eml'))
+    assert parsed['auth']['dkim_domains'] == set()
+    assert 'bigbank.com' not in parsed['envelope_domains']
+    assert parsed['envelope_domains'] == {'spammer-xyz.lat'}
+    assert parsed['primary_domain'] == 'spammer-xyz.lat'
+
+
+def test_dkim_domain_parsing_tolerates_semicolon_in_comment():
+    raw = (
+        b'Authentication-Results: mx.example.com; '
+        b'dkim=pass (1024-bit key; unprotected) header.d=signed.example; '
+        b'spf=pass smtp.mailfrom=signed.example\r\n'
+        b'From: x@signed.example\r\n'
+        b'Subject: t\r\n\r\nbody\r\n'
+    )
+    parsed = spam.parse_message(raw)
+    assert parsed['auth']['dkim'] == 'pass'
+    assert parsed['auth']['dkim_domains'] == {'signed.example'}
