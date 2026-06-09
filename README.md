@@ -134,6 +134,17 @@ VERBOSE_LIST=1 python3 spam-monitor.py
 
 ---
 
+## Testing
+
+Unit tests cover the parsing/extraction layer and the allowlist gating in `process_message`. They use synthetic `.eml` fixtures under `tests/fixtures/` and patch out all network calls, so they run offline in well under a second.
+
+```bash
+pip install pytest      # or: pipenv install --dev
+python3 -m pytest tests/ -q
+```
+
+---
+
 ## Running as a systemd service
 
 For production use on Linux, systemd is cleaner than cron or a manual daemon. Since this runs under your own account, use a user-level service rather than a system-wide one.

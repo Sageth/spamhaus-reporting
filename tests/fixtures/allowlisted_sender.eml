@@ -1,0 +1,13 @@
+Received-SPF: pass (mail.example.com: domain of bounce.google.com designates 209.85.220.41 as permitted sender) client-ip=209.85.220.41;
+Authentication-Results: mail.example.com; spf=pass smtp.mailfrom=accounts.google.com; dkim=pass header.d=google.com; dmarc=pass (p=reject) header.from=google.com
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com;
+ s=20230601; h=from:subject; bh=abc; b=xyz
+From: "Google" <no-reply@accounts.google.com>
+Return-Path: <bounce@google.com>
+Subject: Security alert
+Content-Type: text/html; charset=utf-8
+MIME-Version: 1.0
+
+<html><body>
+<a href="https://myaccount.google.com/security">Review activity</a>
+</body></html>

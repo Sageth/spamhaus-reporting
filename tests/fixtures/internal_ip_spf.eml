@@ -1,0 +1,8 @@
+Received-SPF: pass (mail.example.com: localhost) client-ip=192.168.1.50;
+Authentication-Results: mail.example.com; spf=pass smtp.mailfrom=internal.example; dkim=none; dmarc=none
+From: "Internal" <noreply@internal.example>
+Return-Path: <bounce@internal.example>
+Subject: Internal relay
+Content-Type: text/plain; charset=utf-8
+
+Plain text body, no links.
