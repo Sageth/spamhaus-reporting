@@ -100,6 +100,7 @@ DOMAIN_ALLOWLIST = frozenset({
     'microsoft.com',
     'outlook.com',
     'paypal.com',
+    'reddit.com',
     'stripe.com',
 })
 
