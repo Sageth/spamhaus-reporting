@@ -1,0 +1,7 @@
+Authentication-Results: mail.example.com; spf=none; dkim=none; dmarc=none
+From: "No Auth" <sender@nospf.example>
+Return-Path: <bounce@nospf.example>
+Subject: No SPF header present
+Content-Type: text/plain; charset=utf-8
+
+This message has no Received-SPF header, so no IP should be extracted.

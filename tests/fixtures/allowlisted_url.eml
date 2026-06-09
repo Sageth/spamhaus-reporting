@@ -1,0 +1,14 @@
+Received-SPF: pass (mail.example.com: domain of phish-bait.example designates 198.51.100.7 as permitted sender) client-ip=198.51.100.7;
+Authentication-Results: mail.example.com; spf=pass smtp.mailfrom=phish-bait.example; dkim=fail; dmarc=fail (p=none) header.from=phish-bait.example
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=phish-bait.example;
+ s=default; h=from:subject; bh=abc; b=xyz
+From: "Account Team" <alert@phish-bait.example>
+Return-Path: <bounce@phish-bait.example>
+Subject: Verify your account
+Content-Type: text/html; charset=utf-8
+MIME-Version: 1.0
+
+<html><body>
+<a href="https://www.paypal.com/signin">Sign in to PayPal</a>
+<a href="https://phish-bait.example/steal?id=9">Continue</a>
+</body></html>

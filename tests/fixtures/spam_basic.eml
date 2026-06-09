@@ -1,0 +1,17 @@
+Received-SPF: pass (mail.example.com: domain of rewardsclaim.lat designates 45.92.72.11 as permitted sender) client-ip=45.92.72.11;
+Authentication-Results: mail.example.com; spf=pass smtp.mailfrom=rewardsclaim.lat; dkim=pass header.d=rewardsclaim.lat; dmarc=pass (p=none) header.from=rewardsclaim.lat
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=rewardsclaim.lat;
+ s=default; h=from:subject; bh=abc; b=xyz
+From: "Rewards Team" <noreply@rewardsclaim.lat>
+Reply-To: claims@rewardsclaim.lat
+Return-Path: <bounce@rewardsclaim.lat>
+Subject: You have been selected
+X-Rspamd-Score: 12.4
+Content-Type: text/html; charset=utf-8
+MIME-Version: 1.0
+
+<html><body>
+<a href="https://rewardsclaim.lat/go?utm_source=email&id=42">Claim now</a>
+<a href="https://track.rewardsclaim.lat/click?fbclid=abc">Details</a>
+<a href="https://rewardsclaim.lat/unsubscribe?u=42">Unsubscribe</a>
+</body></html>
