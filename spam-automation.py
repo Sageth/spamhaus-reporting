@@ -701,6 +701,9 @@ def run_account(account):
     folder = account.get('imap_folder', 'Junk')
     conn   = None
     total_processed = 0
+    flagged_ok      = 0
+    flag_failures   = 0
+    fetch_skips     = 0
 
     try:
         conn = connect_imap(account)
@@ -736,6 +739,12 @@ def run_account(account):
         for uid in uids:
             status, msg_data = conn.uid('fetch', uid, '(RFC822)')
             if status != 'OK' or not msg_data or not msg_data[0]:
+                # Fetch never delivered the body, so this UID gets neither \Seen
+                # (the non-peek RFC822 fetch would have set it) nor a keyword flag,
+                # and will be retried next cycle — log it as a distinct stuck path.
+                fetch_skips += 1
+                log.warning(f'  Skipped UID {uid.decode()} — fetch returned {status} '
+                            f'(no body); message stays unread and will be retried next cycle')
                 continue
 
             raw_bytes = msg_data[0][1]
@@ -752,13 +761,23 @@ def run_account(account):
                     # A message whose every parse attempt failed gets FAILED_FLAG instead, so
                     # it is not retried forever yet stays distinct from cleanly-processed mail.
                     flag = PROCESSED_FLAG if result == 'processed' else FAILED_FLAG
-                    conn.uid('store', uid, '+FLAGS', flag)
-                    log.info(f'  Flagged message UID {uid.decode()} as {result}')
+                    # A non-OK store (without an exception) leaves the message
+                    # unflagged, so it is re-fetched and reprocessed every cycle —
+                    # surface it loudly rather than silently looping on it.
+                    store_status, store_data = conn.uid('store', uid, '+FLAGS', flag)
+                    if store_status == 'OK':
+                        flagged_ok += 1
+                        log.info(f'  Flagged message UID {uid.decode()} as {result}')
+                    else:
+                        flag_failures += 1
+                        log.warning(f'  Could not flag message UID {uid.decode()} as {result} '
+                                    f'({store_status}): {store_data} — it will be reprocessed next cycle')
             except Exception as e:
                 log.error(f'  Failed to process message UID {uid.decode()}: {e}')
 
     finally:
-        log.info(f'Done. {total_processed} message(s) processed.')
+        log.info(f'Done. {total_processed} processed, {flagged_ok} flagged, '
+                 f'{flag_failures} flag-failure(s), {fetch_skips} fetch-skip(s).')
         if conn:
             try:
                 conn.logout()
