@@ -1,0 +1,13 @@
+Received-SPF: pass (mail.example.com: domain of evil-spam.example designates 45.92.72.99 as permitted sender) client-ip=45.92.72.99;
+Authentication-Results: mail.example.com; spf=pass smtp.mailfrom=evil-spam.example; dkim=none; dmarc=fail (p=reject) header.from=paypal.com
+From: "PayPal Service" <service@paypal.com>
+Reply-To: verify@evil-spam.example
+Return-Path: <bounce@evil-spam.example>
+Subject: Your account has been limited
+X-Rspamd-Score: 15.1
+Content-Type: text/html; charset=utf-8
+MIME-Version: 1.0
+
+<html><body>
+<a href="https://evil-spam.example/verify?id=99">Restore your account</a>
+</body></html>

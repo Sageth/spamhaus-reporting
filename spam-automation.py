@@ -82,35 +82,97 @@ _TRACKING_PARAMS = frozenset({
     'fbclid', 'gclid', 'msclkid', 'mc_eid', 'mc_cid',
 })
 
-# Domains that should never be submitted to Spamhaus. Messages whose primary
-# domain or envelope domains match (or are a subdomain of) any entry here are
-# skipped entirely — flagged as processed but not submitted.
+# Well-known legitimate brands that should never be submitted to Spamhaus.
+# Two independent protections use this set:
+#   1. A message is skipped entirely when one of its *authenticated* domains
+#      (MTA-verified DKIM signer, or SPF-passing Return-Path) matches an entry
+#      here — see extract_authenticated_domains / submit_parsed. Matching on a
+#      merely *claimed* From/Reply-To domain is intentionally NOT enough, or a
+#      forged From: x@paypal.com would let any spammer dodge reporting.
+#   2. An allowlisted domain is never reported as an indicator, even inside an
+#      otherwise-reportable spam (e.g. a spoofed brand in the From line).
+# Match is exact or on a subdomain (foo.paypal.com matches paypal.com).
+#
+# Only include a brand's OWN domains. Never add shared sending platforms
+# (amazonses.com, sendgrid.net, mailgun.org, sparkpostmail.com, etc.) — real
+# spammers send through those too, and allowlisting them would blind the tool.
 DOMAIN_ALLOWLIST = frozenset({
-    'accounts.google.com',
-    'amazon.com',
-    'amazonaws.com',
-    'apple.com',
-    'bankofamerica.com',
-    'capitalone.com',
-    'chase.com',
-    'cloudflare.com',
-    'github.com',
+    # Consumer email providers
+    'aol.com',
     'gmail.com',
-    'google.com',
     'googlemail.com',
     'hotmail.com',
     'icloud.com',
-    'jpmorgan.com',
     'live.com',
-    'mail.google.com',
     'me.com',
-    'microsoft.com',
     'outlook.com',
-    'paypal.com',
-    'reddit.com',
+    'proton.me',
+    'protonmail.com',
+    'yahoo.com',
+    'ymail.com',
+    'zoho.com',
+    # Big tech / cloud / developer platforms
+    'accounts.google.com',
+    'adobe.com',
+    'amazon.com',
+    'amazonaws.com',
+    'apple.com',
+    'atlassian.com',
+    'cloudflare.com',
+    'dropbox.com',
+    'github.com',
+    'gitlab.com',
+    'google.com',
+    'mail.google.com',
+    'microsoft.com',
+    'microsoftonline.com',
+    'office.com',
     'redhat.com',
+    'slack.com',
+    # Social / media / consumer services
+    'discord.com',
+    'facebook.com',
+    'facebookmail.com',
+    'instagram.com',
+    'linkedin.com',
+    'netflix.com',
+    'pinterest.com',
+    'reddit.com',
+    'redditmail.com',
+    'snapchat.com',
+    'spotify.com',
+    'tiktok.com',
+    'twitch.tv',
+    'x.com',
+    'youtube.com',
+    # Finance / payments / commerce
+    'americanexpress.com',
+    'bankofamerica.com',
+    'capitalone.com',
+    'chase.com',
+    'citi.com',
+    'coinbase.com',
+    'discover.com',
+    'ebay.com',
+    'etsy.com',
+    'fidelity.com',
+    'intuit.com',
+    'jpmorgan.com',
+    'paypal.com',
+    'schwab.com',
+    'shopify.com',
+    'squareup.com',
     'stripe.com',
+    'usbank.com',
+    'venmo.com',
     'wellsfargo.com',
+    'wise.com',
+    # Shipping / delivery (heavily spoofed — protection #1's auth gate matters
+    # most here; a forged From: ups.com with no valid DKIM/SPF is still reported)
+    'dhl.com',
+    'fedex.com',
+    'ups.com',
+    'usps.com',
 })
 
 # Enforce a global socket timeout to prevent half-open TCP hangs
@@ -218,6 +280,25 @@ def extract_primary_domain(msg, dkim_domains):
 
     return None
 
+def extract_authenticated_domains(auth):
+    """Domains the receiving MTA actually vouched for — the only domains the
+    sender allowlist is permitted to skip a whole message on.
+
+    A brand name in From/Reply-To/Return-Path is a forgeable claim: without this
+    gate, any spammer could dodge reporting by writing From: x@paypal.com. So we
+    trust only two things our MTA verified:
+      - DKIM signing domains it validated (dkim=pass header.d=), and
+      - the envelope-from domain SPF validated (spf=pass smtp.mailfrom=…) — SPF
+        authorizes the sending IP for that domain, so it cannot be forged from
+        an unrelated network. We bind to the MTA-recorded smtp.mailfrom, NOT the
+        raw Return-Path header, which a sender can inject a second copy of.
+    A DMARC pass is implied by one of the above aligning with From, so it needs
+    no separate handling."""
+    authed = set(auth.get('dkim_domains') or ())
+    if auth.get('spf') == 'pass' and auth.get('spf_domain'):
+        authed.add(auth['spf_domain'])
+    return authed
+
 def extract_auth_results(msg):
     """Extract SPF, DKIM, DMARC results from Authentication-Results header.
     Uses the top-most header (written by our MTA), strips line folding,
@@ -228,7 +309,7 @@ def extract_auth_results(msg):
     we trust — raw DKIM-Signature d= tags are unverified claims and can be forged
     to frame a third party, so they are deliberately not used."""
     empty = {'spf': 'unknown', 'dkim': 'unknown', 'dmarc': 'unknown',
-             'dmarc_policy': 'unknown', 'dkim_domains': set()}
+             'dmarc_policy': 'unknown', 'dkim_domains': set(), 'spf_domain': ''}
     auth_headers = msg.get_all('Authentication-Results') or []
     if not auth_headers:
         return empty
@@ -247,6 +328,12 @@ def extract_auth_results(msg):
     # read from the comment-bearing string.
     dmarc_policy = extract(r'\b(?:policy\.[A-Za-z_-]*|p)=([A-Za-z]+)')
 
+    # The envelope-from domain SPF actually validated, as our MTA recorded it.
+    # Bind the SPF result to THIS domain, not to raw Return-Path headers a sender
+    # can inject — see extract_authenticated_domains.
+    mf = re.search(r'smtp\.mailfrom=(?:[^@\s;]*@)?([a-zA-Z0-9.-]+)', auth, re.IGNORECASE)
+    spf_domain = _normalize_domain(mf.group(1).strip('.')) if mf else ''
+
     # Strip parenthetical comments before splitting on ';' — comments may contain
     # ';' (e.g. "(1024-bit key; unprotected)") which would corrupt the split.
     dkim_domains = set()
@@ -260,7 +347,8 @@ def extract_auth_results(msg):
                     dkim_domains.add(domain)
 
     return {'spf': spf, 'dkim': dkim, 'dmarc': dmarc,
-            'dmarc_policy': dmarc_policy, 'dkim_domains': dkim_domains}
+            'dmarc_policy': dmarc_policy, 'dkim_domains': dkim_domains,
+            'spf_domain': spf_domain}
 
 def normalize_url(href):
     """Strip tracking parameters, sort remaining params, lowercase hostname,
@@ -367,11 +455,13 @@ def parse_message(raw_bytes, policy=email.policy.default):
     envelope_domains = extract_envelope_domains(msg, auth['dkim_domains'])
     urls             = extract_cta_urls(msg)
     primary_domain   = extract_primary_domain(msg, auth['dkim_domains'])
+    authed_domains   = extract_authenticated_domains(auth)
 
     return {
         'ip':               ip,
         'primary_domain':   primary_domain,
         'envelope_domains': envelope_domains,
+        'authenticated_domains': authed_domains,
         'urls':             urls,
         'auth':             auth,
         'subject':          str(msg.get('Subject', '')),
@@ -515,16 +605,18 @@ def check_submission_count():
 
 def submit_parsed(parsed, raw_bytes, state_tracker):
     """Submit the indicators from an already-parsed message to Spamhaus.
-    Allowlisted senders are skipped entirely. state_tracker deduplicates
-    indicators across messages within a single run."""
+    Messages from an *authenticated* allowlisted sender are skipped entirely;
+    allowlisted domains are never reported as indicators either way.
+    state_tracker deduplicates indicators across messages within a single run."""
     auth   = parsed['auth']
 
-    all_domains = parsed['envelope_domains'] | (
-        {parsed['primary_domain']} if parsed['primary_domain'] else set()
-    )
-    allowlisted = {d for d in all_domains if _is_allowlisted(d)}
+    # Skip the whole message only when an *authenticated* domain is allowlisted.
+    # Matching a claimed From/Reply-To/Return-Path would let any spammer bypass
+    # reporting with a forged From: x@paypal.com — so we gate on the domains our
+    # MTA actually verified (see extract_authenticated_domains).
+    allowlisted = {d for d in parsed['authenticated_domains'] if _is_allowlisted(d)}
     if allowlisted:
-        log.info(f'  Skipping — allowlisted domain(s): {", ".join(sorted(allowlisted))}')
+        log.info(f'  Skipping — allowlisted authenticated domain(s): {", ".join(sorted(allowlisted))}')
         return
 
     log.info(f'  IP={parsed["ip"]} primary_domain={parsed["primary_domain"]}')
@@ -540,13 +632,20 @@ def submit_parsed(parsed, raw_bytes, state_tracker):
             log.info(f'  RIR: netname={ripe.get("netname")} country={ripe.get("country")}')
         submit('ip', parsed['ip'], parsed['ip'], THREAT_IP, REASON_IP(ripe, auth))
 
+    # Never report an allowlisted brand domain as an indicator, even inside an
+    # otherwise-reportable spam (e.g. a forged From: paypal.com that wasn't
+    # authenticated enough to skip the whole message above).
     for domain in parsed['envelope_domains']:
+        if _is_allowlisted(domain):
+            log.info(f'  Skipping allowlisted domain indicator: {domain}')
+            continue
         if domain not in state_tracker['domains']:
             state_tracker['domains'].add(domain)
             submit('domain', domain, domain, THREAT_DOMAIN, REASON_DOMAIN)
 
     # One raw email sample per primary domain per run
-    if parsed['primary_domain'] and parsed['primary_domain'] not in state_tracker['emails']:
+    if (parsed['primary_domain'] and not _is_allowlisted(parsed['primary_domain'])
+            and parsed['primary_domain'] not in state_tracker['emails']):
         state_tracker['emails'].add(parsed['primary_domain'])
         key = f'email:{parsed["primary_domain"]}'
         MAX_EMAIL_BYTES = 1024 * 1024  # 1MB cap — truncate bytes before decoding
@@ -610,9 +709,11 @@ def _attempt_minimal(raw_bytes, state_tracker):
         'ip':               _salvage_ip(raw_bytes),
         'primary_domain':   None,
         'envelope_domains': set(),
+        'authenticated_domains': set(),
         'urls':             [],
         'auth':             {'spf': 'unknown', 'dkim': 'unknown',
-                             'dmarc': 'unknown', 'dmarc_policy': 'unknown'},
+                             'dmarc': 'unknown', 'dmarc_policy': 'unknown',
+                             'dkim_domains': set(), 'spf_domain': ''},
         'subject':          '',
         'rspamd':           'N/A',
     }
