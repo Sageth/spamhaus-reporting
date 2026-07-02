@@ -30,6 +30,39 @@ def test_is_allowlisted(domain, allowed):
     assert spam._is_allowlisted(domain) is allowed
 
 
+# ── apply_custom_allowlist ─────────────────────────────────────────
+
+@pytest.fixture
+def restore_allowlist():
+    """apply_custom_allowlist mutates the module-global DOMAIN_ALLOWLIST;
+    snapshot and restore it so tests don't leak into one another."""
+    original = spam.DOMAIN_ALLOWLIST
+    yield
+    spam.DOMAIN_ALLOWLIST = original
+
+
+def test_custom_allowlist_adds_and_matches(restore_allowlist):
+    assert not spam._is_allowlisted('mytownship.gov')
+    added = spam.apply_custom_allowlist(['mytownship.gov'])
+    assert added == 1
+    assert spam._is_allowlisted('mytownship.gov')          # exact
+    assert spam._is_allowlisted('hoa.mytownship.gov')      # subdomain covered
+
+
+def test_custom_allowlist_normalizes_and_dedupes(restore_allowlist):
+    # Case-folded, whitespace-trimmed, leading '*.'/'.' stripped, blanks dropped,
+    # and entries already present (built-in or duplicate) don't inflate the count.
+    added = spam.apply_custom_allowlist(
+        ['  MyTownship.GOV ', '*.mytownship.gov', '.mytownship.gov', '', 'paypal.com'])
+    assert added == 1
+    assert spam._is_allowlisted('mytownship.gov')
+
+
+def test_custom_allowlist_does_not_drop_builtins(restore_allowlist):
+    spam.apply_custom_allowlist(['mytownship.gov'])
+    assert spam._is_allowlisted('google.com')              # built-in still there
+
+
 # ── _is_internal_ip ────────────────────────────────────────────────
 
 @pytest.mark.parametrize('ip, internal', [

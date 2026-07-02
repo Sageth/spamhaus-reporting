@@ -1,5 +1,10 @@
 {
   "spamhaus_token": "your_spamhaus_api_token",
+  "_allowlist_note": "Optional. Your own never-report domains (township, employer, personal), merged with the built-in brand list. Subdomains are covered automatically, and entries are only skipped when the message is actually authenticated for them (a forged From is still reported).",
+  "allowlist": [
+    "mytownship.gov",
+    "example.com"
+  ],
   "accounts": [
     {
       "imap_server": "mail.example.com",

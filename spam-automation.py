@@ -16,7 +16,10 @@ Required environment variables:
     IMAP_PASSWORD    — your IMAP password
 
     Multi-mailbox mode:
-    ACCOUNTS_CONFIG  — path to a JSON file listing mailbox configs (see accounts.example.json)
+    ACCOUNTS_CONFIG  — path to a JSON file listing mailbox configs (see accounts.example.json).
+                       An optional top-level "allowlist" array in that file adds
+                       your own never-report domains (township, personal, etc.)
+                       to the built-in set — see DOMAIN_ALLOWLIST / apply_custom_allowlist.
 
 Optional environment variables:
     IMAP_FOLDER      — folder to watch (default: Junk); per-account override available in config file
@@ -205,6 +208,24 @@ def _normalize_domain(domain):
 def _is_allowlisted(domain):
     """Return True if domain exactly matches or is a subdomain of any allowlist entry."""
     return any(domain == a or domain.endswith('.' + a) for a in DOMAIN_ALLOWLIST)
+
+def apply_custom_allowlist(entries):
+    """Merge user-supplied allowlist domains (the ACCOUNTS_CONFIG "allowlist"
+    array) into the built-in set. Entries are IDNA-normalized and lowercased so
+    they match subdomains exactly like the built-ins — 'mytownship.gov' also
+    covers 'hoa.mytownship.gov'. A leading '*.' or '.' is tolerated. Custom
+    domains ride the same auth gate as the built-ins: a forged From on one still
+    gets reported unless the message is actually authenticated for it.
+    Returns the number of domains added that were not already present."""
+    global DOMAIN_ALLOWLIST
+    extra = set()
+    for e in entries:
+        d = _normalize_domain(str(e).strip().lstrip('*').lstrip('.'))
+        if d:
+            extra.add(d)
+    added = extra - DOMAIN_ALLOWLIST
+    DOMAIN_ALLOWLIST = frozenset(DOMAIN_ALLOWLIST | extra)
+    return len(added)
 
 def _is_internal_ip(ip):
     """Return True if the IP string is loopback, private, link-local, or reserved."""
@@ -775,6 +796,13 @@ def load_accounts():
                 if not acct.get(key):
                     log.error(f'Account {i + 1} missing required field: {key}')
                     sys.exit(1)
+        custom_allowlist = config.get('allowlist', [])
+        if not isinstance(custom_allowlist, list):
+            log.error(f'ACCOUNTS_CONFIG "allowlist" must be an array of domains: {ACCOUNTS_CONFIG}')
+            sys.exit(1)
+        added = apply_custom_allowlist(custom_allowlist)
+        if added:
+            log.info(f'Loaded {added} custom allowlist domain(s) from ACCOUNTS_CONFIG.')
         return token, accounts
 
     if not all([IMAP_SERVER, IMAP_USER, IMAP_PASSWORD]):
