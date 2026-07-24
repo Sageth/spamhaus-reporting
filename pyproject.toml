@@ -1,0 +1,11 @@
+[project]
+name = "spamhaus-reporting"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "bs4",
+    "requests",
+]
+
+[dependency-groups]
+dev = ["pytest"]

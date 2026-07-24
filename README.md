@@ -24,14 +24,17 @@ For each unprocessed message in your Junk folder, the script:
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) for dependency management
 - A Spamhaus Threat Intel Community account and API token
 - An IMAP mail account with Junk folder access
 - IMAP server that supports custom keyword flags (Dovecot, Cyrus, Gmail — most modern providers)
 
 ```bash
-pip install bs4 requests
+uv sync
 ```
+
+This creates a `.venv` and installs the pinned dependencies from `uv.lock`.
 
 ---
 
@@ -104,7 +107,7 @@ curl -s -H "Authorization: Bearer $SPAMHAUS_TOKEN" \
 **Always dry run first:**
 
 ```bash
-DRY_RUN=1 python3 spam-automation.py
+DRY_RUN=1 uv run spam-automation.py
 ```
 
 This parses every unprocessed message and logs what would be submitted without touching the API or setting any flags. Check the output before running live.
@@ -112,25 +115,25 @@ This parses every unprocessed message and logs what would be submitted without t
 **Single run:**
 
 ```bash
-python3 spam-automation.py
+uv run spam-automation.py
 ```
 
 **Daemon mode (checks every 5 minutes):**
 
 ```bash
-python3 spam-automation.py --daemon --interval 300
+uv run spam-automation.py --daemon --interval 300
 ```
 
 **Cron job (every 10 minutes):**
 
 ```
-*/10 * * * * cd /path/to/spamhaus-reporting && python3 spam-automation.py
+*/10 * * * * cd /path/to/spamhaus-reporting && uv run spam-automation.py
 ```
 
 **Full submission detail:**
 
 ```bash
-VERBOSE_LIST=1 python3 spam-automation.py
+VERBOSE_LIST=1 uv run spam-automation.py
 ```
 
 ---
@@ -140,8 +143,7 @@ VERBOSE_LIST=1 python3 spam-automation.py
 Unit tests cover the parsing/extraction layer and the allowlist gating in `process_message`. They use synthetic `.eml` fixtures under `tests/fixtures/` and patch out all network calls, so they run offline in well under a second.
 
 ```bash
-pip install pytest      # or: pipenv install --dev
-python3 -m pytest tests/ -q
+uv run pytest tests/ -q
 ```
 
 ---
@@ -161,7 +163,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/path/to/spamhaus-reporting
-ExecStart=/usr/bin/python3 spam-automation.py --daemon --interval 300
+ExecStart=%h/.local/bin/uv run spam-automation.py --daemon --interval 300
 Restart=on-failure
 RestartSec=30
 EnvironmentFile=%h/.config/spamhaus-reporting/env
