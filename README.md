@@ -25,8 +25,8 @@ For each unprocessed message in your Junk folder, the script:
 
 ## Requirements
 
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) for dependency management
+- Python 3.10+ (uv installs it for you — no system Python needed)
+- [uv](https://docs.astral.sh/uv/) for dependency and Python management
 - A Spamhaus Threat Intel Community account and API token
 - An IMAP mail account with Junk folder access
 - IMAP server that supports custom keyword flags (Dovecot, Cyrus, Gmail — most modern providers)
@@ -35,7 +35,9 @@ For each unprocessed message in your Junk folder, the script:
 uv sync
 ```
 
-This creates a `.venv` and installs the pinned dependencies from `uv.lock`.
+This creates a `.venv` and installs the pinned dependencies from `uv.lock`. No system
+Python install is needed — uv downloads and manages the interpreter itself, using the
+version pinned in `.python-version`.
 
 ---
 

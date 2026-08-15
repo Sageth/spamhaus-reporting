@@ -129,6 +129,7 @@ DOMAIN_ALLOWLIST = frozenset({
     'apple.com',
     'atlassian.com',
     'cloudflare.com',
+    'cloudflare-email.net',
     'dropbox.com',
     'github.com',
     'gitlab.com',
