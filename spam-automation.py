@@ -287,15 +287,18 @@ def extract_envelope_domains(msg, dkim_domains):
         domains |= _header_domains(msg, field)
     return domains
 
+def _aligns_with(domain, others):
+    """True when domain is one of others, or a sub/parent domain of one."""
+    return any(domain == o or domain.endswith('.' + o) or o.endswith('.' + domain)
+               for o in others)
+
 def _aligned_dkim_domains(msg, dkim_domains):
     """The verified DKIM signers organizationally aligned with the From domain.
     An aligned signer vouched for the address the message claims to be from, so
     it is the accountable origin; unaligned signers belong to someone else on the
     delivery path (an ESP, or a forwarder — see extract_forwarder_domains)."""
     from_domains = _header_domains(msg, 'From')
-    return {d for d in dkim_domains
-            if any(d == f or d.endswith('.' + f) or f.endswith('.' + d)
-                   for f in from_domains)}
+    return {d for d in dkim_domains if _aligns_with(d, from_domains)}
 
 def extract_primary_domain(msg, dkim_domains):
     """Extract the primary sending domain, preferring a DKIM signing domain our
@@ -349,24 +352,34 @@ def extract_forwarder_domains(msg, auth):
     Detection never reads the raw Return-Path: a sender can inject a second copy
     of that header (see extract_authenticated_domains), so an SRS-shaped
     Return-Path would otherwise be a free way to shed a domain indicator. The SRS
-    wrapper is read only from the MTA-recorded smtp.mailfrom, and it counts as
-    forwarding only when the message is *also* DKIM-verified for a different
-    domain aligned with From — i.e. there is a genuine accountable origin left to
-    report. A spammer who SRS-shapes their own envelope-from therefore gains
-    nothing: their own signing domain is the aligned one and stays reportable."""
+    wrapper is read only from the MTA-recorded smtp.mailfrom, and it is ignored
+    when it belongs to the sender themselves — a spammer who SRS-shapes their own
+    envelope-from gains nothing, because the wrapper domain is then the very
+    domain they claim in From/Reply-To (or sign for) and stays reportable.
+
+    Re-signing domains are only subtracted when some signer *is* aligned with
+    From. Without an aligned signer there is no way to tell a forwarding
+    platform's signature from the spammer's own ESP, and guessing would drop real
+    indicators — so on unsigned forwarded spam only the wrapper domain (and, in
+    parse_message, the relay IP) is dropped."""
     if not _SRS_LOCAL.match(auth.get('spf_local') or ''):
         return set()
     wrapper = auth.get('spf_domain') or ''
     if not wrapper:
         return set()
 
-    aligned = _aligned_dkim_domains(msg, auth.get('dkim_domains') or ())
-    if not aligned or aligned <= {wrapper}:
+    dkim_domains = set(auth.get('dkim_domains') or ())
+    aligned = _aligned_dkim_domains(msg, dkim_domains)
+    claimed = _header_domains(msg, 'From') | _header_domains(msg, 'Reply-To')
+    if _aligns_with(wrapper, claimed | aligned):
         return set()
 
-    # The origin signed for itself; every other verified signer on the message
-    # was added by the forwarding path, as was the SRS wrapper domain.
-    return ({wrapper} | set(auth['dkim_domains'])) - aligned
+    forwarders = {wrapper}
+    if aligned:
+        # The origin signed for itself, so every other verified signer on the
+        # message was added by the forwarding path.
+        forwarders |= dkim_domains - aligned
+    return forwarders
 
 def extract_auth_results(msg):
     """Extract SPF, DKIM, DMARC results from Authentication-Results header.

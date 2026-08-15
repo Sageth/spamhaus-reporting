@@ -138,3 +138,19 @@ def test_self_wrapped_srs_envelope_does_not_suppress_reporting(eml, captured_sub
     ips     = {obj for typ, obj in captured_submissions if typ == 'ip'}
     assert 'evil-spam.example' in domains
     assert '45.92.72.99' in ips
+
+
+def test_forwarded_unsigned_spam_still_spares_the_forwarding_victim(eml, captured_submissions):
+    # Same forward as above, but the spam carries no DKIM of its own, so there is
+    # no aligned signer to identify the forwarding platform's signature by. The
+    # SRS wrapper alone still proves the forwarding domain and the relay IP are
+    # not the sender, and both are dropped; the platform's own signing domain is
+    # left in, because at this point it is indistinguishable from a spammer's ESP.
+    spam.process_message(eml('forwarded_srs_unsigned.eml'), _fresh_tracker())
+
+    domains = {obj for typ, obj in captured_submissions if typ == 'domain'}
+    ips     = {obj for typ, obj in captured_submissions if typ == 'ip'}
+
+    assert 'victim-forward.example' not in domains
+    assert ips == set(), 'forwarder relay IP must not be reported'
+    assert 'webdesign-spam.example' in domains
