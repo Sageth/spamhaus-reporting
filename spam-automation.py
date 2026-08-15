@@ -79,6 +79,13 @@ CAPABILITY_FLAG = '$SpamhausCapabilityTest'
 # message is not retried forever yet stays visibly distinct from clean mail.
 FAILED_FLAG     = '$SpamhausFailed'
 
+# Envelope-sender local parts written by the Sender Rewriting Scheme. A forwarder
+# (mailing list, Cloudflare Email Routing, a .forward rule) rewrites the envelope
+# sender into its own domain so SPF still passes after the extra hop — meaning a
+# downstream spf=pass describes the *forwarder*, not the original sender.
+# SRS0/SRS1 with the '=', '+' and '-' separators all appear in the wild.
+_SRS_LOCAL = re.compile(r'^srs[01][=+-]', re.IGNORECASE)
+
 # Tracking parameters appended by spam campaigns to generate unique URLs per recipient.
 _TRACKING_PARAMS = frozenset({
     'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
@@ -122,6 +129,7 @@ DOMAIN_ALLOWLIST = frozenset({
     'apple.com',
     'atlassian.com',
     'cloudflare.com',
+    'cloudflare-email.net',
     'dropbox.com',
     'github.com',
     'gitlab.com',
@@ -280,6 +288,19 @@ def extract_envelope_domains(msg, dkim_domains):
         domains |= _header_domains(msg, field)
     return domains
 
+def _aligns_with(domain, others):
+    """True when domain is one of others, or a sub/parent domain of one."""
+    return any(domain == o or domain.endswith('.' + o) or o.endswith('.' + domain)
+               for o in others)
+
+def _aligned_dkim_domains(msg, dkim_domains):
+    """The verified DKIM signers organizationally aligned with the From domain.
+    An aligned signer vouched for the address the message claims to be from, so
+    it is the accountable origin; unaligned signers belong to someone else on the
+    delivery path (an ESP, or a forwarder — see extract_forwarder_domains)."""
+    from_domains = _header_domains(msg, 'From')
+    return {d for d in dkim_domains if _aligns_with(d, from_domains)}
+
 def extract_primary_domain(msg, dkim_domains):
     """Extract the primary sending domain, preferring a DKIM signing domain our
     MTA verified (Authentication-Results dkim=pass header.d=) over the Return-Path
@@ -288,10 +309,7 @@ def extract_primary_domain(msg, dkim_domains):
     From domain, else pick deterministically. Falls back to Return-Path when
     nothing was DKIM-verified."""
     if dkim_domains:
-        from_domains = _header_domains(msg, 'From')
-        aligned = sorted(d for d in dkim_domains
-                         if any(d == f or d.endswith('.' + f) or f.endswith('.' + d)
-                                for f in from_domains))
+        aligned = sorted(_aligned_dkim_domains(msg, dkim_domains))
         return aligned[0] if aligned else sorted(dkim_domains)[0]
 
     headers_raw = [str(h) for h in (msg.get_all('Return-Path') or [])]
@@ -320,6 +338,50 @@ def extract_authenticated_domains(auth):
         authed.add(auth['spf_domain'])
     return authed
 
+def extract_forwarder_domains(msg, auth):
+    """Domains that belong to a forwarding hop rather than to the sender.
+
+    When spam is forwarded — a mailing list, Cloudflare Email Routing, a plain
+    .forward — the forwarder SRS-rewrites the envelope sender into its own domain
+    and re-signs the message with its own DKIM keys. Our MTA then honestly reports
+    spf=pass for the forwarder and dkim=pass for the forwarding platform, and
+    every one of those domains lands in envelope_domains. Submitting them reports
+    the *victim's own domain* (and the forwarding platform) to Spamhaus for spam
+    they merely relayed. The same hop supplies the topmost Received-SPF, so the
+    sending IP is the forwarder's relay too — see parse_message.
+
+    Detection never reads the raw Return-Path: a sender can inject a second copy
+    of that header (see extract_authenticated_domains), so an SRS-shaped
+    Return-Path would otherwise be a free way to shed a domain indicator. The SRS
+    wrapper is read only from the MTA-recorded smtp.mailfrom, and it is ignored
+    when it belongs to the sender themselves — a spammer who SRS-shapes their own
+    envelope-from gains nothing, because the wrapper domain is then the very
+    domain they claim in From/Reply-To (or sign for) and stays reportable.
+
+    Re-signing domains are only subtracted when some signer *is* aligned with
+    From. Without an aligned signer there is no way to tell a forwarding
+    platform's signature from the spammer's own ESP, and guessing would drop real
+    indicators — so on unsigned forwarded spam only the wrapper domain (and, in
+    parse_message, the relay IP) is dropped."""
+    if not _SRS_LOCAL.match(auth.get('spf_local') or ''):
+        return set()
+    wrapper = auth.get('spf_domain') or ''
+    if not wrapper:
+        return set()
+
+    dkim_domains = set(auth.get('dkim_domains') or ())
+    aligned = _aligned_dkim_domains(msg, dkim_domains)
+    claimed = _header_domains(msg, 'From') | _header_domains(msg, 'Reply-To')
+    if _aligns_with(wrapper, claimed | aligned):
+        return set()
+
+    forwarders = {wrapper}
+    if aligned:
+        # The origin signed for itself, so every other verified signer on the
+        # message was added by the forwarding path.
+        forwarders |= dkim_domains - aligned
+    return forwarders
+
 def extract_auth_results(msg):
     """Extract SPF, DKIM, DMARC results from Authentication-Results header.
     Uses the top-most header (written by our MTA), strips line folding,
@@ -330,7 +392,8 @@ def extract_auth_results(msg):
     we trust — raw DKIM-Signature d= tags are unverified claims and can be forged
     to frame a third party, so they are deliberately not used."""
     empty = {'spf': 'unknown', 'dkim': 'unknown', 'dmarc': 'unknown',
-             'dmarc_policy': 'unknown', 'dkim_domains': set(), 'spf_domain': ''}
+             'dmarc_policy': 'unknown', 'dkim_domains': set(), 'spf_domain': '',
+             'spf_local': ''}
     auth_headers = msg.get_all('Authentication-Results') or []
     if not auth_headers:
         return empty
@@ -352,8 +415,13 @@ def extract_auth_results(msg):
     # The envelope-from domain SPF actually validated, as our MTA recorded it.
     # Bind the SPF result to THIS domain, not to raw Return-Path headers a sender
     # can inject — see extract_authenticated_domains.
-    mf = re.search(r'smtp\.mailfrom=(?:[^@\s;]*@)?([a-zA-Z0-9.-]+)', auth, re.IGNORECASE)
-    spf_domain = _normalize_domain(mf.group(1).strip('.')) if mf else ''
+    # The value may be quoted when the local part contains specials, as SRS
+    # wrappers do: smtp.mailfrom="SRS0=aB=cD=origin.example=user@forwarder.example".
+    # spf_local keeps that local part so extract_forwarder_domains can spot SRS.
+    mf = re.search(r'smtp\.mailfrom="?(?:([^@\s;"]*)@)?([a-zA-Z0-9.-]+)',
+                   auth, re.IGNORECASE)
+    spf_domain = _normalize_domain(mf.group(2).strip('.')) if mf else ''
+    spf_local  = (mf.group(1) or '') if mf else ''
 
     # Strip parenthetical comments before splitting on ';' — comments may contain
     # ';' (e.g. "(1024-bit key; unprotected)") which would corrupt the split.
@@ -369,7 +437,7 @@ def extract_auth_results(msg):
 
     return {'spf': spf, 'dkim': dkim, 'dmarc': dmarc,
             'dmarc_policy': dmarc_policy, 'dkim_domains': dkim_domains,
-            'spf_domain': spf_domain}
+            'spf_domain': spf_domain, 'spf_local': spf_local}
 
 def normalize_url(href):
     """Strip tracking parameters, sort remaining params, lowercase hostname,
@@ -472,17 +540,25 @@ def parse_message(raw_bytes, policy=email.policy.default):
 
     # auth first — its MTA-verified dkim_domains feed domain extraction
     auth             = extract_auth_results(msg)
-    ip               = extract_sending_ip(msg)
-    envelope_domains = extract_envelope_domains(msg, auth['dkim_domains'])
+    # ...then forwarders, which subtract the relaying hop's domains from
+    # everything below: they are authentic but they are not the sender.
+    forwarders       = extract_forwarder_domains(msg, auth)
+    # The topmost Received-SPF is written about the last hop, so on a forwarded
+    # message it records the forwarder's relay IP. Reporting a shared forwarding
+    # relay is worse than reporting nothing, and the origin IP behind it is only
+    # attested by the sender's own hops — so no IP is extracted at all.
+    ip               = None if forwarders else extract_sending_ip(msg)
+    envelope_domains = extract_envelope_domains(msg, auth['dkim_domains']) - forwarders
     urls             = extract_cta_urls(msg)
-    primary_domain   = extract_primary_domain(msg, auth['dkim_domains'])
-    authed_domains   = extract_authenticated_domains(auth)
+    primary_domain   = extract_primary_domain(msg, auth['dkim_domains'] - forwarders)
+    authed_domains   = extract_authenticated_domains(auth) - forwarders
 
     return {
         'ip':               ip,
         'primary_domain':   primary_domain,
         'envelope_domains': envelope_domains,
         'authenticated_domains': authed_domains,
+        'forwarder_domains': forwarders,
         'urls':             urls,
         'auth':             auth,
         'subject':          str(msg.get('Subject', '')),
@@ -640,6 +716,11 @@ def submit_parsed(parsed, raw_bytes, state_tracker):
         log.info(f'  Skipping — allowlisted authenticated domain(s): {", ".join(sorted(allowlisted))}')
         return
 
+    forwarders = parsed.get('forwarder_domains') or set()
+    if forwarders:
+        log.info(f'  Forwarded message — ignoring relay domains and relay IP: '
+                 f'{", ".join(sorted(forwarders))}')
+
     log.info(f'  IP={parsed["ip"]} primary_domain={parsed["primary_domain"]}')
     log.info(f'  Subject: {parsed["subject"]}')
     log.info(f'  Rspamd: {parsed["rspamd"]}')
@@ -731,10 +812,12 @@ def _attempt_minimal(raw_bytes, state_tracker):
         'primary_domain':   None,
         'envelope_domains': set(),
         'authenticated_domains': set(),
+        'forwarder_domains': set(),
         'urls':             [],
         'auth':             {'spf': 'unknown', 'dkim': 'unknown',
                              'dmarc': 'unknown', 'dmarc_policy': 'unknown',
-                             'dkim_domains': set(), 'spf_domain': ''},
+                             'dkim_domains': set(), 'spf_domain': '',
+                             'spf_local': ''},
         'subject':          '',
         'rspamd':           'N/A',
     }

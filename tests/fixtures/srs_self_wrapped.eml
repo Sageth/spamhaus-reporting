@@ -1,0 +1,13 @@
+Received-SPF: pass (mail.example.com: domain of srs0=ab7d=q4=victim-forward.example=info@evil-spam.example designates 45.92.72.99 as permitted sender) client-ip=45.92.72.99;
+Authentication-Results: mail.example.com; spf=pass smtp.mailfrom="SRS0=aB7d=Q4=victim-forward.example=info@evil-spam.example"; dkim=pass header.d=evil-spam.example; dmarc=pass (p=none) header.from=evil-spam.example
+Return-Path: <SRS0=aB7d=Q4=victim-forward.example=info@evil-spam.example>
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=evil-spam.example;
+    s=default; t=1786803409; b=AKHTDLsnjypsvk7DOADX+waC2ihr+eqC30yesYpIxKlz
+Subject: You have won a prize
+From: Prizes <winner@evil-spam.example>
+To: reader@example.org
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+Date: Sat, 15 Aug 2026 14:16:48 +0000 (UTC)
+
+<div><p><a href="https://evil-spam.example/claim">Claim your prize</a></p></div>

@@ -13,6 +13,7 @@ For each unprocessed message in your Junk folder, the script:
 - Extracts the sending IP from the topmost `Received-SPF` header
 - Extracts sending domains from `From`, `Reply-To`, `Return-Path`, and the DKIM signing domain your MTA *verified* (`Authentication-Results` `dkim=pass header.d=`)
 - Extracts and normalizes CTA URLs from the HTML body
+- Detects forwarded mail (SRS envelope rewrite) and drops the forwarding hop's domains and relay IP, so a mailbox that forwards to you is never reported as the spammer
 - Skips any indicator (sending domain, URL, or URL landing domain) matching the built-in domain allowlist
 - Looks up the sending IP against RIPE Stat for infrastructure context
 - Submits IP, domains, URLs, and a raw email sample to the Spamhaus API
@@ -24,8 +25,8 @@ For each unprocessed message in your Junk folder, the script:
 
 ## Requirements
 
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) for dependency management
+- Python 3.10+ (uv installs it for you — no system Python needed)
+- [uv](https://docs.astral.sh/uv/) for dependency and Python management
 - A Spamhaus Threat Intel Community account and API token
 - An IMAP mail account with Junk folder access
 - IMAP server that supports custom keyword flags (Dovecot, Cyrus, Gmail — most modern providers)
@@ -34,7 +35,9 @@ For each unprocessed message in your Junk folder, the script:
 uv sync
 ```
 
-This creates a `.venv` and installs the pinned dependencies from `uv.lock`.
+This creates a `.venv` and installs the pinned dependencies from `uv.lock`. No system
+Python install is needed — uv downloads and manages the interpreter itself, using the
+version pinned in `.python-version`.
 
 ---
 
@@ -265,7 +268,9 @@ A message that cannot be parsed is retried through an escalating fallback ladder
 
 ## Known limitations
 
-**IP extraction requires `Received-SPF`.** The script reads `client-ip=` from the topmost `Received-SPF` header — the SPF evaluation your inbound MX recorded for the host that actually connected to it. For directly-delivered mail this is the true sending source; for mail relayed through a forwarder it is the forwarder's IP (where SPF has usually already failed), so the script can surface forwarding infrastructure on forwarded spam. The IP is submitted regardless of the SPF result. If the header is absent, no IP is submitted, and the lower `Received` chain is deliberately not used as a fallback — those hops are both forgeable and more likely to be legitimate relays.
+**IP extraction requires `Received-SPF`.** The script reads `client-ip=` from the topmost `Received-SPF` header — the SPF evaluation your inbound MX recorded for the host that actually connected to it. For directly-delivered mail this is the true sending source. The IP is submitted regardless of the SPF result. If the header is absent, no IP is submitted, and the lower `Received` chain is deliberately not used as a fallback — those hops are both forgeable and more likely to be legitimate relays. On mail identified as forwarded (below) that same header describes the forwarder's relay, so no IP is submitted at all.
+
+**Forwarded mail is detected via the SRS envelope, and its hops are never reported.** A forwarder — a mailing list, Cloudflare Email Routing, a `.forward` rule — rewrites the envelope sender into its own domain (`SRS0=…=orig.example=user@forwarder.example`) so SPF still passes after the extra hop, and platforms like Cloudflare re-sign the message with their own DKIM keys. Your MX then truthfully records `spf=pass` for the forwarding domain and `dkim=pass` for the forwarding platform, none of which is the spammer. So whenever the SRS wrapper names a domain the sender does not itself claim (in `From` or `Reply-To`) or sign for, the wrapper domain is dropped as an indicator and no IP is submitted. If the message additionally carries a verified signature aligned with `From`, that signer is the accountable origin and every *other* verified signer is dropped as forwarding infrastructure too; without an aligned signer the platform's signature is indistinguishable from a spammer's own ESP, so it is left in rather than guessed away. The wrapper is read only from the MTA-recorded `smtp.mailfrom`, never from the raw `Return-Path` — a sender can inject that header, so reading it would turn an SRS-shaped `Return-Path` into a free way to shed a domain indicator. A spammer who SRS-shapes their own real envelope sender gains nothing either: the wrapper is then their own domain, so nothing is suppressed.
 
 **Header trust assumes your MX sanitizes inbound headers.** Both the IP and the SPF/DKIM/DMARC results are read from the *topmost* `Received-SPF` and `Authentication-Results` headers on the assumption they were stamped by your own inbound MX. That assumption holds only if your MX strips or overwrites any pre-existing copies of those headers; if it does not, a sender can forge a top header and influence what is extracted. The script does not validate the `authserv-id` against your domain.
 
@@ -273,7 +278,7 @@ A message that cannot be parsed is retried through an escalating fallback ladder
 
 **DKIM signing domains are taken only from your MTA's verified result.** The signing domain is read from `Authentication-Results` `dkim=pass header.d=` — i.e. a signature your MX *cryptographically verified* — never from the raw `DKIM-Signature` header. A raw `d=` tag is an unverified claim that anyone can forge (e.g. stapling `d=yourbank.com` with a bogus signature to frame a third party); trusting only verified results closes that poisoning vector while still capturing the spammer's real signing domain.
 
-**With multiple verified signers, the "primary" domain is a tie-break, not a ranking.** When a message carries several `dkim=pass` signatures (e.g. an author domain plus an ESP re-signer), the primary domain prefers the signer aligned with `From`, and otherwise picks the alphabetically-first one. This choice only determines which domain the single raw email sample is grouped under per run; every verified signer and header domain is still submitted independently, so nothing is dropped by the tie-break.
+**With multiple verified signers, the "primary" domain is a tie-break, not a ranking.** When a message carries several `dkim=pass` signatures (e.g. an author domain plus an ESP re-signer), the primary domain prefers the signer aligned with `From`, and otherwise picks the alphabetically-first one. This choice only determines which domain the single raw email sample is grouped under per run; every verified signer and header domain is still submitted independently, so nothing is dropped by the tie-break. The one case where unaligned signers *are* dropped is forwarded mail, above.
 
 **Authentication status is not used to exclude submissions.** A message passing SPF/DKIM/DMARC is *authenticated*, not *legitimate* — spammers routinely authenticate mail sent from their own throwaway domains. A verified domain is in fact the most confidently-reportable indicator (it is provably accountable and cannot be a framed victim). The "unwanted" signal here is simply that the message is in the Junk folder; legitimacy is handled by the allowlist, not by auth results.
 
