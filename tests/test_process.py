@@ -87,3 +87,54 @@ def test_state_tracker_deduplicates_within_run(eml, captured_submissions):
     # Re-processing the same message in the same run should submit nothing new.
     spam.process_message(eml('spam_basic.eml'), tracker)
     assert len(captured_submissions) == first
+
+
+def test_forwarded_spam_reports_sender_not_the_forwarding_path(eml, captured_submissions):
+    # Spam sent to info@victim-forward.example, which forwards to the monitored
+    # mailbox. The forwarder SRS-rewrote the envelope sender into its own domain
+    # and its platform re-signed the message, so our MTA honestly records
+    # spf=pass for victim-forward.example and dkim=pass for both it and
+    # relay-forward.example. None of that is the spammer — only the DKIM signer
+    # aligned with From is. The topmost Received-SPF is the forwarder's relay
+    # too, so no IP is reportable at all.
+    spam.process_message(eml('forwarded_srs.eml'), _fresh_tracker())
+
+    domains = {obj for typ, obj in captured_submissions if typ == 'domain'}
+    urls    = {obj for typ, obj in captured_submissions if typ == 'url'}
+    ips     = {obj for typ, obj in captured_submissions if typ == 'ip'}
+
+    assert 'victim-forward.example' not in domains, 'forwarding victim reported as spammer'
+    assert 'relay-forward.example' not in domains, 'forwarding platform reported as spammer'
+    assert ips == set(), 'forwarder relay IP must not be reported'
+
+    # ...and the actual spammer still is, fully.
+    assert 'webdesign-spam.example' in domains
+    assert any('webdesign-spam.example' in u for u in urls)
+    emails = {obj for typ, obj in captured_submissions if typ == 'email'}
+    assert len(emails) == 1, 'the raw sample is still submitted, keyed on the sender'
+
+
+def test_srs_shaped_return_path_does_not_suppress_reporting(eml, captured_submissions):
+    # Anti-evasion mirror of the test above: the spammer injects an SRS-shaped
+    # Return-Path naming a third party, hoping to be mistaken for a forwarder and
+    # dropped. Forwarding is only ever read from the MTA-recorded smtp.mailfrom
+    # (here a plain bounce@evil-spam.example), so nothing is suppressed.
+    spam.process_message(eml('srs_shaped_return_path.eml'), _fresh_tracker())
+
+    domains = {obj for typ, obj in captured_submissions if typ == 'domain'}
+    ips     = {obj for typ, obj in captured_submissions if typ == 'ip'}
+    assert 'evil-spam.example' in domains
+    assert '45.92.72.99' in ips
+
+
+def test_self_wrapped_srs_envelope_does_not_suppress_reporting(eml, captured_submissions):
+    # The spammer SRS-shapes their *real* envelope sender, so even the trusted
+    # smtp.mailfrom looks like a forward. It buys nothing: the SRS wrapper domain
+    # is the same domain the message is DKIM-aligned for, so there is no separate
+    # origin to fall back to and no domain is treated as a forwarding hop.
+    spam.process_message(eml('srs_self_wrapped.eml'), _fresh_tracker())
+
+    domains = {obj for typ, obj in captured_submissions if typ == 'domain'}
+    ips     = {obj for typ, obj in captured_submissions if typ == 'ip'}
+    assert 'evil-spam.example' in domains
+    assert '45.92.72.99' in ips
