@@ -359,10 +359,11 @@ def extract_forwarder_domains(msg, auth):
     domain they claim in From/Reply-To (or sign for) and stays reportable.
 
     Re-signing domains are only subtracted when some signer *is* aligned with
-    From. Without an aligned signer there is no way to tell a forwarding
-    platform's signature from the spammer's own ESP, and guessing would drop real
-    indicators — so on unsigned forwarded spam only the wrapper domain (and, in
-    parse_message, the relay IP) is dropped."""
+    From, or when the signer is allowlisted. Without an aligned signer there is
+    no way to tell a forwarding platform's signature from the spammer's own ESP,
+    and guessing would drop real indicators — so on unsigned forwarded spam only
+    the wrapper domain, allowlisted forwarding infrastructure, and (in
+    parse_message) the relay IP are dropped."""
     if not _SRS_LOCAL.match(auth.get('spf_local') or ''):
         return set()
     wrapper = auth.get('spf_domain') or ''
@@ -380,6 +381,12 @@ def extract_forwarder_domains(msg, auth):
         # The origin signed for itself, so every other verified signer on the
         # message was added by the forwarding path.
         forwarders |= dkim_domains - aligned
+    else:
+        # No aligned signer, so a re-signing domain is ambiguous — except when it
+        # is allowlisted. Allowlisted domains are unreportable anyway, but leaving
+        # one in authenticated_domains would trip the whole-message skip in
+        # submit_parsed and silently swallow the forwarded spam.
+        forwarders |= {d for d in dkim_domains if _is_allowlisted(d)}
     return forwarders
 
 def extract_auth_results(msg):

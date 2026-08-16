@@ -154,3 +154,20 @@ def test_forwarded_unsigned_spam_still_spares_the_forwarding_victim(eml, capture
     assert 'victim-forward.example' not in domains
     assert ips == set(), 'forwarder relay IP must not be reported'
     assert 'webdesign-spam.example' in domains
+
+
+def test_allowlisted_forwarding_relay_does_not_suppress_the_whole_message(eml, captured_submissions):
+    # Unsigned forwarded spam where the forwarding platform's signing domain is on
+    # the allowlist (cloudflare-email.net). An allowlisted *authenticated* domain
+    # normally means "skip this message entirely" — but here it is only present
+    # because of the forwarding hop, so it must be treated as a forwarder and the
+    # spam reported as usual.
+    spam.process_message(eml('forwarded_srs_allowlisted_relay.eml'), _fresh_tracker())
+
+    domains = {obj for typ, obj in captured_submissions if typ == 'domain'}
+    ips     = {obj for typ, obj in captured_submissions if typ == 'ip'}
+
+    assert 'webdesign-spam.example' in domains, 'spam must still be reported'
+    assert 'cloudflare-email.net' not in domains
+    assert 'victim-forward.example' not in domains
+    assert ips == set(), 'forwarder relay IP must not be reported'
