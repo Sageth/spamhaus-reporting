@@ -171,3 +171,19 @@ def test_allowlisted_forwarding_relay_does_not_suppress_the_whole_message(eml, c
     assert 'cloudflare-email.net' not in domains
     assert 'victim-forward.example' not in domains
     assert ips == set(), 'forwarder relay IP must not be reported'
+    # The relay is also kept out of primary_domain: an allowlisted primary would
+    # suppress the raw email sample, the most useful artefact in the report.
+    assert any(typ == 'email' for typ, _ in captured_submissions)
+
+
+def test_forward_without_srs_does_not_suppress_the_whole_message(eml, captured_submissions):
+    # A Gmail account with "forward all mail" turned on: no SRS rewrite, so the
+    # forwarding-hop detection never fires, and gmail.com authenticates by both
+    # SPF and DKIM. gmail.com is allowlisted, but it is not the From domain — the
+    # skip must key on the sender's identity, not on the carrier's.
+    spam.process_message(eml('forwarded_no_srs.eml'), _fresh_tracker())
+
+    domains = {obj for typ, obj in captured_submissions if typ == 'domain'}
+
+    assert 'webdesign-spam.example' in domains, 'spam must still be reported'
+    assert 'gmail.com' not in domains

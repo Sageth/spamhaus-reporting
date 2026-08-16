@@ -1,0 +1,27 @@
+Received-SPF: pass (mx.example.net: domain of reader@gmail.com designates 209.85.220.41 as permitted sender) client-ip=209.85.220.41;
+Authentication-Results: mx.example.net;
+       dkim=pass header.i=@gmail.com header.s=20230601 header.b=Nn4rTqZk;
+       dkim=none;
+       spf=pass (mx.example.net: domain of reader@gmail.com designates 209.85.220.41 as permitted sender) smtp.mailfrom=reader@gmail.com;
+       dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=webdesign-spam.example
+Return-Path: <reader@gmail.com>
+Received: from mail-sor-f41.google.com (mail-sor-f41.google.com. [209.85.220.41])
+        by mx.example.net with SMTPS id 4c1f9a0b7e21
+        for <archive@example.org>; Sat, 15 Aug 2026 07:16:59 -0700 (PDT)
+X-Forwarded-To: archive@example.org
+X-Forwarded-For: reader@gmail.com archive@example.org
+Received: from relay.mailhop.example (23.83.223.110)
+        by mx.google.com with ESMTPS id b7si2210984qkf
+        for <reader@gmail.com>; Sat, 15 Aug 2026 14:16:55 +0000 (UTC)
+Subject: Your business website, but faster
+From: Digital Experts <marcus@webdesign-spam.example>
+To: reader@gmail.com
+Reply-To: marcus@webdesign-spam.example
+Message-ID: <178680340813.1595.1634716286450181819@webdesign-spam.example>
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+Date: Sat, 15 Aug 2026 14:16:48 +0000 (UTC)
+
+<div><p>So I rebuilt your site for you, free.</p>
+<p><a href="https://webdesign-spam.example/demo/your-business-ed98f?e=780452819e">View your 3 website styles</a></p>
+<p><a href="https://webdesign-spam.example/api/outreach/book?slug=your-business-ed98f">Book your free design call</a></p></div>

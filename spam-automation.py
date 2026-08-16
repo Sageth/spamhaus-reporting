@@ -95,10 +95,12 @@ _TRACKING_PARAMS = frozenset({
 # Well-known legitimate brands that should never be submitted to Spamhaus.
 # Two independent protections use this set:
 #   1. A message is skipped entirely when one of its *authenticated* domains
-#      (MTA-verified DKIM signer, or SPF-passing Return-Path) matches an entry
-#      here — see extract_authenticated_domains / submit_parsed. Matching on a
-#      merely *claimed* From/Reply-To domain is intentionally NOT enough, or a
-#      forged From: x@paypal.com would let any spammer dodge reporting.
+#      (MTA-verified DKIM signer, or SPF-passing envelope-from) matches an entry
+#      here AND aligns with From — see extract_sender_domains / submit_parsed.
+#      A merely *claimed* From/Reply-To domain is intentionally NOT enough, or a
+#      forged From: x@paypal.com would let any spammer dodge reporting; an
+#      unaligned authenticated domain is not enough either, or a forwarding hop
+#      could veto the report for spam it only relayed.
 #   2. An allowlisted domain is never reported as an indicator, even inside an
 #      otherwise-reportable spam (e.g. a spoofed brand in the From line).
 # Match is exact or on a subdomain (foo.paypal.com matches paypal.com).
@@ -319,24 +321,34 @@ def extract_primary_domain(msg, dkim_domains):
 
     return None
 
-def extract_authenticated_domains(auth):
-    """Domains the receiving MTA actually vouched for — the only domains the
-    sender allowlist is permitted to skip a whole message on.
+def extract_sender_domains(msg, auth):
+    """Domains that authenticated *as the sender* — the only domains the
+    allowlist is permitted to skip a whole message on.
 
-    A brand name in From/Reply-To/Return-Path is a forgeable claim: without this
-    gate, any spammer could dodge reporting by writing From: x@paypal.com. So we
-    trust only two things our MTA verified:
+    Two conditions, both required.
+
+    First, the receiving MTA must actually have vouched for the domain. A brand
+    name in From/Reply-To/Return-Path is a forgeable claim: without this gate,
+    any spammer could dodge reporting by writing From: x@paypal.com. So we trust
+    only two things our MTA verified:
       - DKIM signing domains it validated (dkim=pass header.d=), and
       - the envelope-from domain SPF validated (spf=pass smtp.mailfrom=…) — SPF
         authorizes the sending IP for that domain, so it cannot be forged from
         an unrelated network. We bind to the MTA-recorded smtp.mailfrom, NOT the
         raw Return-Path header, which a sender can inject a second copy of.
-    A DMARC pass is implied by one of the above aligning with From, so it needs
-    no separate handling."""
+
+    Second, the domain must align with From. Authenticating is not the same as
+    being the sender: every relay on the delivery path authenticates for itself.
+    A Gmail account that forwards its mail to you produces spf=pass and dkim=pass
+    for gmail.com on somebody else's spam — and gmail.com is allowlisted, so
+    without alignment the forward would silently veto the report. Requiring the
+    allowlisted identity to be the one in From is the same test DMARC applies,
+    and it keeps the skip about who the mail is *from* rather than about which
+    infrastructure carried it."""
     authed = set(auth.get('dkim_domains') or ())
     if auth.get('spf') == 'pass' and auth.get('spf_domain'):
         authed.add(auth['spf_domain'])
-    return authed
+    return {d for d in authed if _aligns_with(d, _header_domains(msg, 'From'))}
 
 def extract_forwarder_domains(msg, auth):
     """Domains that belong to a forwarding hop rather than to the sender.
@@ -351,7 +363,7 @@ def extract_forwarder_domains(msg, auth):
     sending IP is the forwarder's relay too — see parse_message.
 
     Detection never reads the raw Return-Path: a sender can inject a second copy
-    of that header (see extract_authenticated_domains), so an SRS-shaped
+    of that header (see extract_sender_domains), so an SRS-shaped
     Return-Path would otherwise be a free way to shed a domain indicator. The SRS
     wrapper is read only from the MTA-recorded smtp.mailfrom, and it is ignored
     when it belongs to the sender themselves — a spammer who SRS-shapes their own
@@ -383,9 +395,12 @@ def extract_forwarder_domains(msg, auth):
         forwarders |= dkim_domains - aligned
     else:
         # No aligned signer, so a re-signing domain is ambiguous — except when it
-        # is allowlisted. Allowlisted domains are unreportable anyway, but leaving
-        # one in authenticated_domains would trip the whole-message skip in
-        # submit_parsed and silently swallow the forwarded spam.
+        # is allowlisted, which no spammer's own ESP will be. Dropping it costs
+        # nothing (an allowlisted domain is never reported as an indicator) and
+        # buys something specific: left in, it would be the only candidate for
+        # primary_domain, and an allowlisted primary_domain suppresses the raw
+        # email sample in submit_parsed. Without this the sample silently goes
+        # unsubmitted on every unsigned forward through allowlisted infra.
         forwarders |= {d for d in dkim_domains if _is_allowlisted(d)}
     return forwarders
 
@@ -421,7 +436,7 @@ def extract_auth_results(msg):
 
     # The envelope-from domain SPF actually validated, as our MTA recorded it.
     # Bind the SPF result to THIS domain, not to raw Return-Path headers a sender
-    # can inject — see extract_authenticated_domains.
+    # can inject — see extract_sender_domains.
     # The value may be quoted when the local part contains specials, as SRS
     # wrappers do: smtp.mailfrom="SRS0=aB=cD=origin.example=user@forwarder.example".
     # spf_local keeps that local part so extract_forwarder_domains can spot SRS.
@@ -558,13 +573,13 @@ def parse_message(raw_bytes, policy=email.policy.default):
     envelope_domains = extract_envelope_domains(msg, auth['dkim_domains']) - forwarders
     urls             = extract_cta_urls(msg)
     primary_domain   = extract_primary_domain(msg, auth['dkim_domains'] - forwarders)
-    authed_domains   = extract_authenticated_domains(auth) - forwarders
+    sender_domains   = extract_sender_domains(msg, auth) - forwarders
 
     return {
         'ip':               ip,
         'primary_domain':   primary_domain,
         'envelope_domains': envelope_domains,
-        'authenticated_domains': authed_domains,
+        'sender_domains':   sender_domains,
         'forwarder_domains': forwarders,
         'urls':             urls,
         'auth':             auth,
@@ -709,18 +724,19 @@ def check_submission_count():
 
 def submit_parsed(parsed, raw_bytes, state_tracker):
     """Submit the indicators from an already-parsed message to Spamhaus.
-    Messages from an *authenticated* allowlisted sender are skipped entirely;
+    Messages whose allowlisted sender domain authenticated are skipped entirely;
     allowlisted domains are never reported as indicators either way.
     state_tracker deduplicates indicators across messages within a single run."""
     auth   = parsed['auth']
 
-    # Skip the whole message only when an *authenticated* domain is allowlisted.
-    # Matching a claimed From/Reply-To/Return-Path would let any spammer bypass
-    # reporting with a forged From: x@paypal.com — so we gate on the domains our
-    # MTA actually verified (see extract_authenticated_domains).
-    allowlisted = {d for d in parsed['authenticated_domains'] if _is_allowlisted(d)}
+    # Skip the whole message only when an allowlisted domain authenticated as the
+    # sender. Matching a claimed From/Reply-To/Return-Path would let any spammer
+    # bypass reporting with a forged From: x@paypal.com; matching any authenticated
+    # domain would let a forwarding hop veto the report for spam it merely carried.
+    # See extract_sender_domains for both halves.
+    allowlisted = {d for d in parsed['sender_domains'] if _is_allowlisted(d)}
     if allowlisted:
-        log.info(f'  Skipping — allowlisted authenticated domain(s): {", ".join(sorted(allowlisted))}')
+        log.info(f'  Skipping — allowlisted sender domain(s): {", ".join(sorted(allowlisted))}')
         return
 
     forwarders = parsed.get('forwarder_domains') or set()
@@ -818,7 +834,7 @@ def _attempt_minimal(raw_bytes, state_tracker):
         'ip':               _salvage_ip(raw_bytes),
         'primary_domain':   None,
         'envelope_domains': set(),
-        'authenticated_domains': set(),
+        'sender_domains':   set(),
         'forwarder_domains': set(),
         'urls':             [],
         'auth':             {'spf': 'unknown', 'dkim': 'unknown',
