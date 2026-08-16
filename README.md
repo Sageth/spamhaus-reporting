@@ -286,6 +286,10 @@ A message that cannot be parsed is retried through an escalating fallback ladder
 
 **URL landing domains may be legitimate redirectors.** CDN hostnames, link shorteners, and ESP tracking domains sometimes appear in spam. The script submits them — unless they match the allowlist — so whether a non-allowlisted redirector adds intelligence value depends on the campaign.
 
+**The allowlist holds brand-owned domains, never shared sending infrastructure.** Entries are the corporate domains brands send their own mail from. A shared platform's *sending or tracking* domains (`sendgrid.net`, `mailgun.org`, `ccsend.com`, `rs6.net`, `list-manage.com`, `s3.amazonaws.com` …) are deliberately excluded: spammers send and host through those too, and since matching covers subdomains, one such entry would blind the URL and landing-domain checks for every campaign built on that platform. `amazonaws.com` is absent for exactly this reason — it would swallow every phishing page hosted on an S3 bucket. Adding an ESP's corporate domain (`mailchimp.com`) is safe and roughly inert; adding its sending domain is not.
+
+**Consumer email providers are the allowlist's real cost.** `gmail.com`, `outlook.com` and friends are listed, so spam sent from a genuine throwaway account at one of them authenticates, aligns with `From`, and is skipped rather than reported. That covers a lot of advance-fee and romance scam mail. The alternative — reporting the provider's domain to Spamhaus — is worse, so the entries stay, but the blind spot is real and widens with each provider added.
+
 **Allowlisting is exact-or-subdomain only.** A domain is skipped when it equals an allowlist entry or is a subdomain of one (e.g. `mail.google.com` matches `google.com`). Lookalikes such as `evil-paypal.com` are intentionally not matched. Edit `DOMAIN_ALLOWLIST` in the script to tune it.
 
 **IMAP keyword support varies.** Most modern servers support custom keywords. Some hosted providers don't. The script tests for support at startup and aborts if the server rejects the flag.

@@ -105,29 +105,50 @@ _TRACKING_PARAMS = frozenset({
 #      otherwise-reportable spam (e.g. a spoofed brand in the From line).
 # Match is exact or on a subdomain (foo.paypal.com matches paypal.com).
 #
-# Only include a brand's OWN domains. Never add shared sending platforms
-# (amazonses.com, sendgrid.net, mailgun.org, sparkpostmail.com, etc.) — real
-# spammers send through those too, and allowlisting them would blind the tool.
+# Only include a brand's OWN domains — the corporate domain a brand sends its
+# own mail from. Never add the *sending or tracking* infrastructure of a shared
+# platform (sendgrid.net, mailgun.org, sparkpostmail.com, ccsend.com, rs6.net,
+# list-manage.com, hubspotemail.net, klclick.com, s3.amazonaws.com …). Real
+# spammers send and host through those too, and because matching covers
+# subdomains, one entry there blinds the URL and landing-domain checks for every
+# campaign built on that platform. amazonaws.com is deliberately absent for
+# exactly this reason: it would swallow every phishing page on an S3 bucket.
 DOMAIN_ALLOWLIST = frozenset({
-    # Consumer email providers
+    # Consumer email providers. Note these are the one category where protection
+    # #1 has real cost: spam sent from a genuine throwaway account at one of
+    # these authenticates and aligns, so it is skipped rather than reported.
     'aol.com',
+    'att.net',
+    'charter.net',
+    'comcast.net',
+    'cox.net',
+    'earthlink.net',
+    'fastmail.com',
     'gmail.com',
+    'gmx.com',
     'googlemail.com',
+    'hey.com',
     'hotmail.com',
     'icloud.com',
     'live.com',
+    'mail.com',
     'me.com',
+    'msn.com',
     'outlook.com',
     'proton.me',
     'protonmail.com',
+    'sbcglobal.net',
+    'tuta.com',
+    'tutanota.com',
+    'verizon.net',
     'yahoo.com',
+    'yandex.com',
     'ymail.com',
     'zoho.com',
     # Big tech / cloud / developer platforms
     'accounts.google.com',
     'adobe.com',
     'amazon.com',
-    'amazonaws.com',
     'apple.com',
     'atlassian.com',
     'cloudflare.com',
@@ -135,13 +156,30 @@ DOMAIN_ALLOWLIST = frozenset({
     'dropbox.com',
     'github.com',
     'gitlab.com',
+    'godaddy.com',
     'google.com',
+    'ibm.com',
     'mail.google.com',
     'microsoft.com',
     'microsoftonline.com',
     'office.com',
+    'okta.com',
+    'oracle.com',
     'redhat.com',
+    'salesforce.com',
     'slack.com',
+    'zoom.us',
+    # Email marketing platforms — CORPORATE domains only, for the mail these
+    # companies send about themselves. Their customer campaigns go out under the
+    # customer's own From and are unaffected. Their sending and link-tracking
+    # domains are deliberately excluded (see the note above).
+    'brevo.com',
+    'constantcontact.com',
+    'hubspot.com',
+    'klaviyo.com',
+    'mailchimp.com',
+    'mailgun.com',
+    'sendgrid.com',
     # Social / media / consumer services
     'discord.com',
     'facebook.com',
@@ -159,9 +197,11 @@ DOMAIN_ALLOWLIST = frozenset({
     'x.com',
     'youtube.com',
     # Finance / payments / commerce
+    'ally.com',
     'americanexpress.com',
     'bankofamerica.com',
     'capitalone.com',
+    'cash.app',
     'chase.com',
     'citi.com',
     'coinbase.com',
@@ -171,15 +211,48 @@ DOMAIN_ALLOWLIST = frozenset({
     'fidelity.com',
     'intuit.com',
     'jpmorgan.com',
+    'navyfederal.org',
     'paypal.com',
+    'pnc.com',
+    'robinhood.com',
     'schwab.com',
     'shopify.com',
     'squareup.com',
     'stripe.com',
+    'truist.com',
     'usbank.com',
     'venmo.com',
     'wellsfargo.com',
     'wise.com',
+    'zellepay.com',
+    # Retail / travel / delivery services
+    'airbnb.com',
+    'bestbuy.com',
+    'booking.com',
+    'costco.com',
+    'doordash.com',
+    'instacart.com',
+    'target.com',
+    'uber.com',
+    'walmart.com',
+    # Telecom
+    'att.com',
+    't-mobile.com',
+    'verizon.com',
+    'xfinity.com',
+    # Government, credit bureaus, identity and security vendors — the domains
+    # most costly to report by mistake, and among the most forged
+    '1password.com',
+    'docusign.com',
+    'docusign.net',
+    'equifax.com',
+    'experian.com',
+    'irs.gov',
+    'lastpass.com',
+    'mcafee.com',
+    'norton.com',
+    'ssa.gov',
+    'transunion.com',
     # Shipping / delivery (heavily spoofed — protection #1's auth gate matters
     # most here; a forged From: ups.com with no valid DKIM/SPF is still reported)
     'dhl.com',
