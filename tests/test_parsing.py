@@ -190,3 +190,19 @@ def test_dkim_domain_parsing_tolerates_semicolon_in_comment():
     parsed = spam.parse_message(raw)
     assert parsed['auth']['dkim'] == 'pass'
     assert parsed['auth']['dkim_domains'] == {'signed.example'}
+
+
+def test_shared_platform_infrastructure_is_not_allowlisted():
+    # Allowlisting matches subdomains, so a single shared-infrastructure entry
+    # would blind the URL and landing-domain checks for every campaign built on
+    # that platform. Phishing pages on S3 buckets are the canonical case.
+    for host in ('mybucket.s3.amazonaws.com', 'ec2-1-2-3-4.compute-1.amazonaws.com',
+                 'r20.rs6.net', 'x.list-manage.com', 'mail.sendgrid.net',
+                 'mg.mailgun.org', 'track.klclick.com', 'x.hubspotemail.net'):
+        assert not spam._is_allowlisted(host), f'{host} must stay reportable'
+
+
+def test_brand_corporate_domains_are_allowlisted():
+    for host in ('irs.gov', 'equifax.com', 'docusign.net', 'walmart.com',
+                 'constantcontact.com', 'gmx.com', 'amazon.com'):
+        assert spam._is_allowlisted(host), f'{host} should be allowlisted'
