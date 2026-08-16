@@ -1,0 +1,38 @@
+Received-SPF: pass (mx.example.net: domain of srs0=ab7d=q4=webdesign-spam.example=marcus@victim-forward.example designates 104.30.10.77 as permitted sender) client-ip=104.30.10.77;
+Authentication-Results: mx.example.net;
+       dkim=pass header.i=@cloudflare-email.net header.s=cf2024-1 header.b=CwDoJUxt;
+       dkim=pass header.i=@victim-forward.example header.s=cf2024-1 header.b=EpkMvwnD;
+       dkim=none;
+       arc=pass (i=1 spf=pass spfdomain=webdesign-spam.example dkim=pass dkdomain=webdesign-spam.example dmarc=pass fromdomain=webdesign-spam.example);
+       spf=pass (mx.example.net: domain of srs0=ab7d=q4=webdesign-spam.example=marcus@victim-forward.example designates 104.30.10.77 as permitted sender) smtp.mailfrom="SRS0=aB7d=Q4=webdesign-spam.example=marcus@victim-forward.example";
+       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=webdesign-spam.example
+Return-Path: <SRS0=aB7d=Q4=webdesign-spam.example=marcus@victim-forward.example>
+Received: from ba-hh.cloudflare-email.net (ba-hh.cloudflare-email.net. [104.30.10.77])
+        by mx.example.net with ESMTPS id d9443c01a7336
+        for <reader@example.org>; Sat, 15 Aug 2026 07:16:59 -0700 (PDT)
+X-Forwarded-To: reader@example.org
+X-Forwarded-For: info@victim-forward.example reader@example.org
+Received: from relay.mailhop.example (23.83.223.110)
+        by cloudflare-email.net (cloudflare) id JbIW3lrtZGfC
+        for <info@victim-forward.example>; Sat, 15 Aug 2026 14:16:55 +0000
+Received-SPF: pass (mx.cloudflare-email.net: domain of marcus@webdesign-spam.example designates 23.83.223.110 as permitted sender)
+    receiver=mx.cloudflare-email.net; client-ip=23.83.223.110; envelope-from="marcus@webdesign-spam.example";
+Authentication-Results: mx.cloudflare-email.net;
+    dkim=pass header.d=webdesign-spam.example header.s=hostingermail-a header.b=AKHTDLsn;
+    dmarc=pass header.from=webdesign-spam.example policy.dmarc=none;
+    spf=pass (mx.cloudflare-email.net: domain of marcus@webdesign-spam.example designates 23.83.223.110 as permitted sender) smtp.mailfrom=marcus@webdesign-spam.example;
+    arc=none smtp.remote-ip=23.83.223.110
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=webdesign-spam.example;
+    s=hostingermail-a; t=1786803409; b=AKHTDLsnjypsvk7DOADX+waC2ihr+eqC30yesYpIxKlz
+Subject: Your business website, but faster
+From: Digital Experts <marcus@webdesign-spam.example>
+To: info@victim-forward.example
+Reply-To: marcus@webdesign-spam.example
+Message-ID: <178680340813.1595.1634716286450181819@webdesign-spam.example>
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+Date: Sat, 15 Aug 2026 14:16:48 +0000 (UTC)
+
+<div><p>So I rebuilt your site for you, free.</p>
+<p><a href="https://webdesign-spam.example/demo/your-business-ed98f?e=780452819e">View your 3 website styles</a></p>
+<p><a href="https://webdesign-spam.example/api/outreach/book?slug=your-business-ed98f">Book your free design call</a></p></div>
