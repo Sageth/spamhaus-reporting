@@ -1005,6 +1005,78 @@ def connect_imap(account):
     return conn
 
 
+def _parse_flag_line(line):
+    """Pull (uid, {flags}) out of one FETCH FLAGS response line."""
+    uid_match   = re.search(rb'UID (\d+)', line)
+    flags_match = re.search(rb'FLAGS \(([^)]*)\)', line)
+    if not uid_match or not flags_match:
+        return None, set()
+    return uid_match.group(1), {f.decode('ascii', 'replace')
+                                for f in flags_match.group(1).split()}
+
+
+def fetch_flags(conn, uid_set='1:*'):
+    """Return {uid: {flag, ...}} for uid_set, or None if the FETCH failed."""
+    status, data = conn.uid('fetch', uid_set, '(FLAGS)')
+    if status != 'OK':
+        return None
+    flags = {}
+    for item in data or []:
+        line = item[0] if isinstance(item, tuple) else item
+        if not isinstance(line, bytes):
+            continue
+        uid, message_flags = _parse_flag_line(line)
+        if uid:
+            flags[uid] = message_flags
+    return flags
+
+
+def store_flag(conn, uid, flag, remove=False):
+    """Add or remove one keyword on a message, returning imaplib's (status, data).
+
+    The flag goes in a parenthesised list. That is the canonical STORE form and
+    the only one iCloud accepts — a bare '+FLAGS $Keyword' earns a BAD Parse
+    Error there. A BAD reply makes imaplib raise rather than return a status, so
+    translate it back into a status the callers already degrade on gracefully.
+    """
+    try:
+        return conn.uid('store', uid, '-FLAGS' if remove else '+FLAGS', f'({flag})')
+    except imaplib.IMAP4.error as e:
+        return 'BAD', [str(e).encode()]
+
+
+def unprocessed_uids(conn):
+    """UIDs in the selected folder not yet flagged processed or failed.
+
+    State is read by fetching flags and filtering here rather than by asking the
+    server for 'NOT KEYWORD $SpamhausProcessed'. iCloud stores custom keywords
+    and hands them back from FETCH, but its SEARCH ignores any keyword outside
+    its own advertised set: the filter matches every message, so the folder would
+    be reprocessed every cycle with no error to show for it. FETCH FLAGS behaves
+    the same on every server, so this is one path for all of them.
+    """
+    flags = fetch_flags(conn)
+    if flags is None:
+        return None
+    return sorted((uid for uid, message_flags in flags.items()
+                   if PROCESSED_FLAG not in message_flags and FAILED_FLAG not in message_flags),
+                  key=int)
+
+
+def custom_keywords_supported(conn, uid):
+    """Set a test keyword, read it back, remove it — does state survive here?
+
+    Reading it back is the point: a server can answer OK to the STORE and retain
+    nothing, which would silently reprocess the mailbox forever.
+    """
+    if store_flag(conn, uid, CAPABILITY_FLAG)[0] != 'OK':
+        return False
+    flags  = fetch_flags(conn, uid)
+    stored = flags is not None and CAPABILITY_FLAG in flags.get(uid, set())
+    store_flag(conn, uid, CAPABILITY_FLAG, remove=True)  # best effort
+    return stored
+
+
 def run_account(account):
     """Process one mailbox: connect, process unprocessed messages, flag, disconnect. Returns count."""
     folder = account.get('imap_folder', 'Junk')
@@ -1021,33 +1093,39 @@ def run_account(account):
             log.error(f'Could not select folder: {folder}')
             return 0
 
-        status, data = conn.uid('search', None,
-                                 f'NOT KEYWORD {PROCESSED_FLAG} NOT KEYWORD {FAILED_FLAG}')
-        if status != 'OK' or not data[0]:
+        uids = unprocessed_uids(conn)
+        if uids is None:
+            log.error(f'Could not read message flags in folder: {folder}')
+            return 0
+        if not uids:
             log.info(f'Folder {folder}: No unprocessed messages.')
             return 0
 
-        uids = data[0].split()
         log.info(f'Folder {folder}: {len(uids)} unprocessed message(s)')
 
-        # Functional capability check — attempt to set and immediately remove a test flag.
-        # Fails fast if the server doesn't support custom IMAP keywords.
-        if not DRY_RUN:
-            test_status, _ = conn.uid('store', uids[0], '+FLAGS', CAPABILITY_FLAG)
-            if test_status != 'OK':
-                log.critical('IMAP server rejected custom keyword flags — cannot track state. Skipping account.')
-                return 0
-            try:
-                conn.uid('store', uids[0], '-FLAGS', CAPABILITY_FLAG)
-            except Exception:
-                pass  # Non-fatal — flag will be ignored by processing logic
+        # Functional capability check — fails fast rather than looping forever on
+        # a server that cannot hold the state this tool runs on.
+        if not DRY_RUN and not custom_keywords_supported(conn, uids[0]):
+            log.critical('IMAP server will not retain custom keyword flags — '
+                         'cannot track state. Skipping account.')
+            return 0
 
         # State tracker deduplicates indicators across all messages in this run
         state_tracker = {'ips': set(), 'domains': set(), 'urls': set(), 'emails': set()}
 
         for uid in uids:
-            status, msg_data = conn.uid('fetch', uid, '(RFC822)')
-            if status != 'OK' or not msg_data or not msg_data[0]:
+            # BODY[], not the RFC822 alias: iCloud answers an RFC822 fetch with a
+            # bare '1 (UID 1)' and no body at all, while BODY[] is core IMAP4rev1
+            # and behaves identically everywhere. Neither is a PEEK, so the \Seen
+            # side effect this relies on as a processed-indicator is unchanged.
+            status, msg_data = conn.uid('fetch', uid, '(BODY[])')
+            # The body is the literal half of a (header, body) tuple, but servers
+            # differ on where that tuple sits, so take the first tuple carrying a
+            # literal rather than trusting a fixed position.
+            raw_bytes = next((part[1] for part in msg_data or []
+                              if isinstance(part, tuple) and len(part) > 1
+                              and isinstance(part[1], (bytes, bytearray))), None)
+            if status != 'OK' or not raw_bytes:
                 # Fetch never delivered the body, so this UID gets neither \Seen
                 # (the non-peek RFC822 fetch would have set it) nor a keyword flag,
                 # and will be retried next cycle — log it as a distinct stuck path.
@@ -1056,7 +1134,6 @@ def run_account(account):
                             f'(no body); message stays unread and will be retried next cycle')
                 continue
 
-            raw_bytes = msg_data[0][1]
             log.info(f'Processing message UID {uid.decode()}')
 
             try:
@@ -1073,7 +1150,7 @@ def run_account(account):
                     # A non-OK store (without an exception) leaves the message
                     # unflagged, so it is re-fetched and reprocessed every cycle —
                     # surface it loudly rather than silently looping on it.
-                    store_status, store_data = conn.uid('store', uid, '+FLAGS', flag)
+                    store_status, store_data = store_flag(conn, uid, flag)
                     if store_status == 'OK':
                         flagged_ok += 1
                         log.info(f'  Flagged message UID {uid.decode()} as {result}')
@@ -1112,7 +1189,11 @@ def run_once():
 
     grand_total = 0
     for account in accounts:
-        grand_total += run_account(account)
+        try:
+            grand_total += run_account(account)
+        except Exception as e:
+            log.error(f'Account {account.get("imap_user", "?")} failed: {e} '
+                      f'— continuing with remaining accounts')
 
     if grand_total and not DRY_RUN:
         try:
