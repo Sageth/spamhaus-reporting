@@ -20,6 +20,14 @@
       "imap_password": "your_gmail_app_password",
       "imap_folder": "[Gmail]/Spam",
       "_note": "Gmail requires an App Password (not your Google password): myaccount.google.com/apppasswords. Spam folder is [Gmail]/Spam, not Spam."
+    },
+    {
+      "imap_server": "imap.mail.me.com",
+      "imap_port": 993,
+      "imap_user": "you@icloud.com",
+      "imap_password": "your_icloud_app_specific_password",
+      "imap_folder": "Junk",
+      "_note": "iCloud requires an App-Specific Password (account.apple.com) and 2FA on the Apple ID. No OAuth. If login fails with the full address, try just the local part."
     }
   ]
 }

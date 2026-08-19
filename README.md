@@ -29,7 +29,7 @@ For each unprocessed message in your Junk folder, the script:
 - [uv](https://docs.astral.sh/uv/) for dependency and Python management
 - A Spamhaus Threat Intel Community account and API token
 - An IMAP mail account with Junk folder access
-- IMAP server that supports custom keyword flags (Dovecot, Cyrus, Gmail — most modern providers)
+- IMAP server that retains custom keyword flags (Dovecot, Cyrus, Gmail, iCloud — most modern providers)
 
 ```bash
 uv sync
@@ -83,6 +83,16 @@ Copy `accounts.example.json` to a location outside the repository (e.g. `~/.conf
 ```
 
 Each account entry supports `imap_server`, `imap_port`, `imap_user`, `imap_password`, and `imap_folder`. `imap_port` and `imap_folder` are optional and default to `993` and `Junk`.
+
+**Provider notes**
+
+| Provider | Server | Folder | Password |
+|---|---|---|---|
+| Gmail | `imap.gmail.com` | `[Gmail]/Spam` | [App Password](https://myaccount.google.com/apppasswords), not your Google password |
+| iCloud | `imap.mail.me.com` | `Junk` | [App-Specific Password](https://account.apple.com), requires 2FA on the Apple ID |
+| Dovecot / Cyrus | your host | `Junk` | account password |
+
+iCloud needs no OAuth, app registration or token refresh — but it is the reason processed-state is read by fetching flags and filtering here, rather than by asking the server to search on them. iCloud stores custom keywords and returns them from `FETCH`, while its `SEARCH` ignores any keyword outside its own advertised set, so a server-side `NOT KEYWORD` filter matches every message there and would silently reprocess the mailbox on every cycle. iCloud also rejects the unparenthesised `STORE +FLAGS $Keyword` form other servers accept.
 
 **Behavior flags** (apply to all modes):
 
