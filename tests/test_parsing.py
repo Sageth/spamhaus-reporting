@@ -206,3 +206,33 @@ def test_brand_corporate_domains_are_allowlisted():
     for host in ('irs.gov', 'equifax.com', 'docusign.net', 'walmart.com',
                  'constantcontact.com', 'gmx.com', 'amazon.com'):
         assert spam._is_allowlisted(host), f'{host} should be allowlisted'
+
+
+# ── tracker-link handling (extract_cta_urls) ───────────────────────
+
+def _html_msg(html):
+    import email
+    from email.message import EmailMessage
+    m = EmailMessage()
+    m.set_content('x')
+    m.add_alternative(html, subtype='html')
+    return m
+
+
+def test_tracker_urls_collapse_to_one():
+    base = 'https://pod.example.net/index.php/campaigns/c1/track-url/s1/'
+    links = ''.join(f'<a href="{base}{i:040x}">x</a>' for i in range(1, 30))
+    urls = spam.extract_cta_urls(_html_msg(links))
+    assert len(urls) == 1
+
+
+def test_distinct_paths_are_not_collapsed():
+    html = '<a href="https://a.example/shop">a</a><a href="https://a.example/cart">b</a>'
+    assert len(spam.extract_cta_urls(_html_msg(html))) == 2
+
+
+def test_opaque_unsubscribe_anchor_is_skipped():
+    tok = 'e' * 40
+    html = (f'<a href="https://t.example/track-url/s/{tok}">Unsubscribe</a>'
+            '<a href="https://t.example/go" data-unsubtag="_UNSUBSCRIBE_URL_">x</a>')
+    assert spam.extract_cta_urls(_html_msg(html)) == []
