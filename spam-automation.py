@@ -574,9 +574,36 @@ def _is_unsubscribe_link(href):
     candidates += [k.lower() for k, _ in parse_qsl(parsed.query)]
     return any(tok in cand for cand in candidates for tok in _UNSUB_TOKENS)
 
+# Link-tracking redirectors hide the real destination behind a per-link hash
+# (/track-url/<campaign>/<hash>), including the unsubscribe link, so the URL
+# alone can't identify it. The anchor text or data-unsubtag attribute can.
+_UNSUB_TEXT = re.compile(r'unsubscribe|opt[\s_-]?out', re.IGNORECASE)
+
+def _is_unsubscribe_anchor(a):
+    return a.has_attr('data-unsubtag') or bool(_UNSUB_TEXT.search(a.get_text(' ', strip=True)))
+
+# A path segment that is a long hex digest is a per-link/per-recipient token.
+_TOKEN_SEGMENT = re.compile(r'^[0-9a-f]{16,}$', re.IGNORECASE)
+
+def _url_shape(url):
+    """(scheme, host, path with hex-token segments masked). URLs that share a
+    shape are one tracker template, not distinct destinations."""
+    p = urlparse(url)
+    segs = ['*' if _TOKEN_SEGMENT.match(seg) else seg for seg in p.path.split('/')]
+    return (p.scheme, p.netloc, '/'.join(segs))
+
+def _collapse_tracker_urls(urls):
+    """Keep one URL per shape: a newsletter with 85 hash-only tracker links
+    reports one, not 85 near-identical submissions. Sorted for determinism."""
+    reps = {}
+    for url in sorted(urls):
+        reps.setdefault(_url_shape(url), url)
+    return list(reps.values())
+
 def extract_cta_urls(msg):
-    """Extract action URLs from HTML body. Strips tracking parameters and skips
-    unsubscribe/optout links which are structural, not malicious endpoints."""
+    """Extract action URLs from HTML body. Strips tracking parameters, skips
+    unsubscribe/optout links (structural, not malicious endpoints) and collapses
+    per-link tracker hashes to one representative URL."""
     urls = set()
     for part in msg.walk():
         if part.get_content_type() == 'text/html':
@@ -588,7 +615,7 @@ def extract_cta_urls(msg):
                     href = a['href'].strip()
                     if not href.startswith(('http://', 'https://')):
                         continue
-                    if _is_unsubscribe_link(href):
+                    if _is_unsubscribe_link(href) or _is_unsubscribe_anchor(a):
                         continue
                     normalized = normalize_url(href)
                     if normalized:
@@ -598,7 +625,7 @@ def extract_cta_urls(msg):
             finally:
                 if soup:
                     soup.decompose()
-    return list(urls)
+    return _collapse_tracker_urls(urls)
 
 @lru_cache(maxsize=2048)
 def rir_lookup(ip):
@@ -721,7 +748,7 @@ def submit(submission_type, key, object_value, threat_type, reason):
     label = key.replace('email:', '') if submission_type == 'email' else key
     if DRY_RUN:
         log.info(f'  [DRY RUN] Would submit {submission_type.upper()}: {label}')
-        return
+        return None
     status, body = spamhaus_request(f'submissions/add/{submission_type}', {
         'threat_type': threat_type,
         'reason': reason,
@@ -733,6 +760,7 @@ def submit(submission_type, key, object_value, threat_type, reason):
             time.sleep(DELAY)
     else:
         log.warning(f'  {submission_type.upper()} {label} — failed ({status}): {body}')
+    return status, body
 
 def check_submission_count():
     """Log submission count, breakdown by type, and optionally full submission list."""
@@ -795,6 +823,9 @@ def check_submission_count():
 # PROCESSING
 # ─────────────────────────────────────────────
 
+# Descending prefix sizes tried for the raw email sample.
+EMAIL_SAMPLE_SIZES = (64 * 1024, 32 * 1024, 16 * 1024, 8 * 1024)
+
 def submit_parsed(parsed, raw_bytes, state_tracker):
     """Submit the indicators from an already-parsed message to Spamhaus.
     Messages whose allowlisted sender domain authenticated are skipped entirely;
@@ -846,9 +877,15 @@ def submit_parsed(parsed, raw_bytes, state_tracker):
             and parsed['primary_domain'] not in state_tracker['emails']):
         state_tracker['emails'].add(parsed['primary_domain'])
         key = f'email:{parsed["primary_domain"]}'
-        MAX_EMAIL_BYTES = 1024 * 1024  # 1MB cap — truncate bytes before decoding
-        email_sample = raw_bytes[:MAX_EMAIL_BYTES].decode('utf-8', errors='replace')
-        submit('email', key, email_sample, THREAT_EMAIL, REASON_EMAIL)
+        # Spamhaus rejects oversized samples with a 400 ("email content exceeds
+        # max length") at a size well under 100 KB, and bulk-mail HTML easily
+        # exceeds it. Headers and the leading text part carry the evidence, so
+        # retry with a shorter prefix rather than losing the sample.
+        for size in EMAIL_SAMPLE_SIZES:
+            email_sample = raw_bytes[:size].decode('utf-8', errors='replace')
+            result = submit('email', key, email_sample, THREAT_EMAIL, REASON_EMAIL)
+            if not (result and result[0] == 400 and 'length' in str(result[1]).lower()):
+                break
 
     for url in parsed['urls']:
         try:

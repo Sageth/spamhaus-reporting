@@ -187,3 +187,20 @@ def test_forward_without_srs_does_not_suppress_the_whole_message(eml, captured_s
 
     assert 'webdesign-spam.example' in domains, 'spam must still be reported'
     assert 'gmail.com' not in domains
+
+
+def test_email_sample_retries_smaller_on_length_400(monkeypatch, eml):
+    sizes = []
+
+    def fake_submit(submission_type, key, object_value, threat_type, reason):
+        if submission_type == 'email':
+            sizes.append(len(object_value))
+            if len(sizes) < 3:
+                return 400, {'message': 'email content exceeds max length'}
+        return 200, {}
+
+    monkeypatch.setattr(spam, 'submit', fake_submit)
+    monkeypatch.setattr(spam, 'rir_lookup', lambda ip: {})
+    raw = eml('spam_basic.eml') + b'A' * (200 * 1024)
+    spam.process_message(raw, {'ips': set(), 'domains': set(), 'urls': set(), 'emails': set()})
+    assert sizes == [64 * 1024, 32 * 1024, 16 * 1024]
