@@ -236,6 +236,8 @@ sudo loginctl enable-linger $USER
 
 ---
 
+## How state is tracked
+
 The script uses a custom IMAP keyword flag (`$SpamhausProcessed`) instead of a local database or flat file. This means:
 
 - No local files to manage or back up
