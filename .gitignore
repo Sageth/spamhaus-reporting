@@ -19,3 +19,9 @@ venv/
 
 # macOS
 .DS_Store
+
+# Local credentials and config (keep these outside the repo; ignored as a safety net)
+accounts.json
+.env
+.env.*
+!.env.example
