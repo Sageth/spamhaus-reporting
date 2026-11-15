@@ -496,16 +496,38 @@ def extract_auth_results(msg):
     # Top-most header is from our MTA — flatten line folding
     auth = re.sub(r'\s+', ' ', str(auth_headers[0]))
 
-    def extract(pattern):
-        m = re.search(pattern, auth, re.IGNORECASE)
-        return m.group(1).lower() if m else 'unknown'
+    # Split into top-level ';' clauses, paren-aware: comments may contain ';' and,
+    # more importantly, may embed other results. Gmail appends the ARC verdict as
+    # "arc=pass (i=2 spf=pass ... dmarc=pass ...)" BEFORE its own spf=/dmarc=
+    # clauses, so a first-match regex over the whole string reads the *previous
+    # hops'* results (and reports dmarc=pass for a dmarc=fail message). Only a
+    # method=result at the start of a clause is our MTA's own verdict.
+    clauses, depth, cur = [], 0, []
+    for ch in auth:
+        if ch == '(':
+            depth += 1
+        elif ch == ')' and depth:
+            depth -= 1
+        if ch == ';' and depth == 0:
+            clauses.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    clauses.append(''.join(cur))
 
-    spf          = extract(r'\bspf=(pass|fail|softfail|neutral|none|permerror|temperror)\b')
-    dkim         = extract(r'\bdkim=(pass|fail|none|policy|neutral|temperror|permerror)\b')
-    dmarc        = extract(r'\bdmarc=(pass|fail|none|bestguesspass|temperror|permerror)\b')
-    # p= legitimately lives inside the DMARC comment "(p=none ...)", so policy is
-    # read from the comment-bearing string.
-    dmarc_policy = extract(r'\b(?:policy\.[A-Za-z_-]*|p)=([A-Za-z]+)')
+    def extract_clause(method, values):
+        for clause in clauses:
+            m = re.match(rf'\s*{method}=({values})\b', clause, re.IGNORECASE)
+            if m:
+                return m.group(1).lower(), clause
+        return 'unknown', ''
+
+    spf, spf_clause = extract_clause('spf', 'pass|fail|softfail|neutral|none|permerror|temperror')
+    dkim, _         = extract_clause('dkim', 'pass|fail|none|policy|neutral|temperror|permerror')
+    dmarc, dmarc_clause = extract_clause('dmarc', 'pass|fail|none|bestguesspass|temperror|permerror')
+    # p= legitimately lives inside the DMARC clause's own comment "(p=none ...)".
+    pm = re.search(r'\b(?:policy\.[A-Za-z_-]*|p)=([A-Za-z]+)', dmarc_clause, re.IGNORECASE)
+    dmarc_policy = pm.group(1).lower() if pm else 'unknown'
 
     # The envelope-from domain SPF actually validated, as our MTA recorded it.
     # Bind the SPF result to THIS domain, not to raw Return-Path headers a sender
@@ -514,7 +536,7 @@ def extract_auth_results(msg):
     # wrappers do: smtp.mailfrom="SRS0=aB=cD=origin.example=user@forwarder.example".
     # spf_local keeps that local part so extract_forwarder_domains can spot SRS.
     mf = re.search(r'smtp\.mailfrom="?(?:([^@\s;"]*)@)?([a-zA-Z0-9.-]+)',
-                   auth, re.IGNORECASE)
+                   spf_clause, re.IGNORECASE)
     spf_domain = _normalize_domain(mf.group(2).strip('.')) if mf else ''
     spf_local  = (mf.group(1) or '') if mf else ''
 

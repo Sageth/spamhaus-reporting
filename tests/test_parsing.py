@@ -236,3 +236,23 @@ def test_opaque_unsubscribe_anchor_is_skipped():
     html = (f'<a href="https://t.example/track-url/s/{tok}">Unsubscribe</a>'
             '<a href="https://t.example/go" data-unsubtag="_UNSUBSCRIBE_URL_">x</a>')
     assert spam.extract_cta_urls(_html_msg(html)) == []
+
+
+def test_auth_results_ignore_results_embedded_in_arc_comment():
+    # Gmail puts "arc=pass (i=2 spf=pass ... dmarc=pass ...)" before its own
+    # verdicts. Those embedded results describe earlier hops, not our MTA.
+    raw = (
+        b'Authentication-Results: mx.google.com; '
+        b'dkim=pass header.i=@fwd.example header.s=s1; '
+        b'arc=pass (i=2 spf=pass spfdomain=sender.example dkim=pass '
+        b'dmarc=pass fromdomain=sender.example); '
+        b'spf=softfail (google.com: domain of x does not designate) '
+        b'smtp.mailfrom="SRS0=AJ2U=dj=sender.example=u@fwd.example"; '
+        b'dmarc=fail (p=NONE sp=NONE dis=NONE) header.from=sender.example\r\n'
+        b'From: u@sender.example\r\nSubject: t\r\n\r\nbody\r\n'
+    )
+    auth = spam.parse_message(raw)['auth']
+    assert auth['spf'] == 'softfail'
+    assert auth['dmarc'] == 'fail'
+    assert auth['dmarc_policy'] == 'none'
+    assert auth['spf_domain'] == 'fwd.example'
