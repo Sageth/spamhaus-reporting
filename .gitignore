@@ -22,6 +22,7 @@ venv/
 
 # Local credentials and config (keep these outside the repo; ignored as a safety net)
 accounts.json
+accounts.jsonc
 .env
 .env.*
 !.env.example

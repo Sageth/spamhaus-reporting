@@ -63,7 +63,7 @@ version pinned in `.python-version`.
 
 | Variable | Description |
 |---|---|
-| `ACCOUNTS_CONFIG` | Absolute path to a JSON config file (see `accounts.example.json`) |
+| `ACCOUNTS_CONFIG` | Absolute path to a JSON config file; `//` and `/* */` comments and trailing commas are allowed, so you can comment out an account while testing (see `accounts.example.json`) |
 
 Copy `accounts.example.json` to a location outside the repository (e.g. `~/.config/spamhaus-reporting/accounts.json`), fill in your credentials, and set `ACCOUNTS_CONFIG` to that path. The file must never be committed — keep it outside the repo entirely. When `ACCOUNTS_CONFIG` is set, `SPAMHAUS_TOKEN` does not need to be set as an env var.
 
