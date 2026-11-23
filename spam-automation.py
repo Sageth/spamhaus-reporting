@@ -16,7 +16,7 @@ Required environment variables:
     IMAP_PASSWORD    — your IMAP password
 
     Multi-mailbox mode:
-    ACCOUNTS_CONFIG  — path to a JSON file listing mailbox configs (see accounts.example.json).
+    ACCOUNTS_CONFIG  — path to a JSON file (// comments and trailing commas allowed) listing mailbox configs (see accounts.example.json).
                        An optional top-level "allowlist" array in that file adds
                        your own never-report domains (township, personal, etc.)
                        to the built-in set — see DOMAIN_ALLOWLIST / apply_custom_allowlist.
@@ -1009,12 +1009,67 @@ def process_message(raw_bytes, state_tracker):
 # IMAP
 # ─────────────────────────────────────────────
 
+def parse_jsonc(text):
+    """Parse JSON with // and /* */ comments and trailing commas (JSONC).
+
+    Comments and trailing commas are removed only outside string literals, so
+    values like "http://x" or "a//b" survive. Plain JSON parses unchanged.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == '\\' else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith('//', i):
+            while i < n and text[i] not in '\r\n':
+                i += 1
+        elif text.startswith('/*', i):
+            end = text.find('*/', i + 2)
+            if end == -1:
+                raise json.JSONDecodeError('Unterminated /* comment', text, i)
+            out.append('\n' * text.count('\n', i, end))
+            i = end + 2
+        else:
+            out.append(c)
+            i += 1
+    # Drop trailing commas (outside strings) before } or ].
+    stripped = ''.join(out)
+    result = []
+    i, n = 0, len(stripped)
+    while i < n:
+        c = stripped[i]
+        if c == '"':
+            j = i + 1
+            while j < n and stripped[j] != '"':
+                j += 2 if stripped[j] == '\\' else 1
+            result.append(stripped[i:j + 1])
+            i = j + 1
+        elif c == ',':
+            k = i + 1
+            while k < n and stripped[k].isspace():
+                k += 1
+            if k < n and stripped[k] in '}]':
+                i += 1
+                continue
+            result.append(c)
+            i += 1
+        else:
+            result.append(c)
+            i += 1
+    return json.loads(''.join(result))
+
+
 def load_accounts():
     """Return (spamhaus_token, accounts) from ACCOUNTS_CONFIG file, or fall back to env vars."""
     if ACCOUNTS_CONFIG:
         try:
             with open(os.path.expandvars(os.path.expanduser(ACCOUNTS_CONFIG))) as f:
-                config = json.load(f)
+                config = parse_jsonc(f.read())
         except (OSError, json.JSONDecodeError) as e:
             log.error(f'Could not load ACCOUNTS_CONFIG {ACCOUNTS_CONFIG}: {e}')
             sys.exit(1)
